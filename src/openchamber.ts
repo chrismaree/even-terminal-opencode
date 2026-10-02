@@ -1,8 +1,8 @@
-// OpenChamber local API client (:57123). Endpoints verified against the
-// OpenChamber desktop app (v1.22) — see vendor/ README notes.
+// OpenCode v2 HTTP API client. Talks to OpenChamber (:57123), which proxies
+// the opencode v2 `/api/*` surface, or directly to an opencode server.
+// Verified against OpenChamber desktop 2.0.4 / opencode 2.0.20.
 
-import { execFileSync } from "node:child_process";
-
+/** Normalized session row (v2 `Session.Info` with `location.directory` lifted). */
 export interface OcSession {
   id: string;
   title?: string;
@@ -11,281 +11,283 @@ export interface OcSession {
   parentID?: string | null;
   agent?: string;
   model?: { id: string; providerID: string; variant?: string };
-  time?: { created?: number; updated?: number; archived?: number | null };
+  time?: { created?: number; updated?: number; idle?: number; archived?: number | null };
 }
 
+export interface OcToolContent {
+  type: "tool";
+  id: string;
+  name: string;
+  state: {
+    status?: string;
+    input?: Record<string, unknown>;
+    content?: Array<{ type: string; text?: string }>;
+    error?: { message?: string };
+    metadata?: Record<string, unknown>;
+  };
+}
+
+export type OcAssistantContent =
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
+  | OcToolContent;
+
+/** v2 session message (flat, typed). Only the fields the bridge reads. */
 export interface OcMessage {
-  info: { id: string; role: string; time?: { created?: number } };
-  parts: Array<{
-    type: string;
-    text?: string;
-    synthetic?: boolean;
-    ignored?: boolean;
-    tool?: string;
-    callID?: string;
-    state?: {
-      status?: string;
-      title?: string;
-      input?: unknown;
-      output?: string;
-      metadata?: unknown;
-    };
-  }>;
+  id: string;
+  type: string;
+  time?: { created?: number; completed?: number };
+  /** user / synthetic / system */
+  text?: string;
+  /** assistant */
+  content?: OcAssistantContent[];
+  cost?: number;
+  tokens?: { input?: number; output?: number };
+  error?: { message?: string };
+  /** shell */
+  command?: string;
 }
 
-/** Pending permission as served by GET /api/permission. */
+/** v2 `Permission.Request`. */
 export interface OcPermission {
   id: string;
-  sessionID?: string;
-  sessionId?: string;
-  type?: string;
+  sessionID: string;
+  action: string;
+  resources?: string[];
+  save?: string[];
+  metadata?: Record<string, unknown>;
+  message?: string;
+}
+
+export interface OcFormOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface OcFormField {
+  key: string;
+  type: string;
   title?: string;
-  pattern?: string | string[];
-  patterns?: string[];
-  metadata?: { always?: string[] } & Record<string, unknown>;
-  [key: string]: unknown;
+  description?: string;
+  required?: boolean;
+  hidden?: boolean;
+  options?: OcFormOption[];
+  custom?: boolean;
 }
 
-/** Ask-user question as surfaced by opencode's question API. */
-export interface OcQuestion {
+/** v2 `Form.Info` (ask-user questions are forms in v2). */
+export interface OcForm {
   id: string;
-  sessionID?: string;
-  sessionId?: string;
-  questions?: Array<{
-    question?: string;
-    header?: string;
-    multiple?: boolean;
-    options?: Array<{ label?: string; description?: string }>;
-  }>;
-  [key: string]: unknown;
+  sessionID: string;
+  title: string;
+  fields: OcFormField[];
+  metadata?: Record<string, unknown>;
 }
 
-export interface OcSessionActivity {
-  [sessionId: string]: { type: string };
+export interface OcProject {
+  id: string;
+  /** v2 `canonical` */
+  worktree?: string;
+  sandboxes?: string[];
 }
+
+export type OcPermissionReply = "once" | "always" | "reject";
 
 const DEFAULT_TIMEOUT_MS = 8000;
 
+export class OpenChamberHttpError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function rec(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function unwrapData<T>(body: unknown): T {
+  const obj = rec(body);
+  return ("data" in obj ? obj.data : body) as T;
+}
+
+/** Lift v2 `location.directory` onto the flat `directory` the bridge uses. */
+export function normalizeSession(raw: unknown): OcSession {
+  const s = rec(raw);
+  const location = rec(s.location);
+  const directory =
+    typeof location.directory === "string"
+      ? location.directory
+      : typeof s.directory === "string"
+        ? s.directory
+        : undefined;
+  return { ...(s as unknown as OcSession), directory };
+}
+
+function locationQuery(directory?: string): string {
+  return directory ? `?location[directory]=${encodeURIComponent(directory)}` : "";
+}
+
+export interface OpenChamberClientOptions {
+  /** Full Authorization header value (e.g. `Basic …`) for protected servers. */
+  authorization?: string;
+  fetchImpl?: typeof fetch;
+}
+
 export class OpenChamberClient {
-  private readonly base: string;
+  readonly base: string;
+  readonly authorization?: string;
   private readonly fetchImpl: typeof fetch;
 
-  constructor(base: string, fetchImpl: typeof fetch = fetch) {
-    this.base = base;
-    this.fetchImpl = fetchImpl;
+  constructor(base: string, opts: OpenChamberClientOptions | typeof fetch = {}) {
+    const o = typeof opts === "function" ? { fetchImpl: opts } : opts;
+    this.base = base.replace(/\/+$/, "");
+    this.authorization = o.authorization;
+    this.fetchImpl = o.fetchImpl ?? fetch;
   }
 
-  // ── direct opencode server access ─────────────────────
-  // OpenChamber's local HTTP API has no reply routes (the desktop app
-  // answers asks/permissions via internal IPC). The opencode server itself
-  // exposes them with HTTP Basic auth (user "opencode", password from the
-  // serve process env OPENCODE_SERVER_PASSWORD).
-
-  private directBase = "";
-  private directAuth = "";
-
-  /** Find the opencode serve process: port from argv, password from env. */
-  async resolveDirectServer(
-    run: (cmd: string, args: string[]) => string = (cmd, args) =>
-      execFileSync(cmd, args, { encoding: "utf8" }),
-  ): Promise<boolean> {
-    try {
-      const pgrepOut = run("pgrep", ["-f", "opencode serve"]);
-      for (const pid of pgrepOut.split("\n").filter(Boolean)) {
-        const env = run("ps", ["eww", pid]);
-        const port = env.match(/--port (\d+)/)?.[1];
-        const password = env.match(/OPENCODE_SERVER_PASSWORD=([^\s]+)/)?.[1];
-        if (port && password) {
-          this.directBase = `http://127.0.0.1:${port}`;
-          this.directAuth = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
-          return true;
-        }
-      }
-    } catch {
-      // ps/pgrep unavailable or no opencode serve process
-    }
-    return false;
-  }
-
-  private async directRequest<T>(path: string, body: unknown, directory?: string): Promise<T> {
-    if (!this.directBase) {
-      const ok = await this.resolveDirectServer();
-      if (!ok) throw new Error("opencode server not discoverable");
-    }
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    const res = await this.fetchImpl(`${this.directBase}${path}${qs}`, {
-      method: "POST",
-      headers: {
-        Authorization: this.directAuth,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-    if (res.status === 401) {
-      this.resetDirectServer();
-      throw new Error(`opencode ${path} -> HTTP 401 (re-discovering)`);
-    }
-    if (!res.ok) throw new Error(`opencode ${path} -> HTTP ${res.status}`);
-    if (res.status === 204) return undefined as T;
-    const ct = res.headers.get("content-type") ?? "";
-    if (!ct.includes("json")) return undefined as T;
-    return (await res.json()) as T;
-  }
-
-  /**
-   * Reply to an opencode question directly on the opencode server.
-   * `answers` is one array of selected labels per question (multi-select).
-   */
-  replyQuestionDirect(requestId: string, answers: string[][], directory?: string): Promise<unknown> {
-    return this.directRequest(`/question/${encodeURIComponent(requestId)}/reply`, { answers }, directory);
-  }
-
-  /** Reply to an opencode permission request directly (reply: once|always|reject). */
-  replyPermissionDirect(requestId: string, reply: string, directory?: string): Promise<unknown> {
-    return this.directRequest(`/permission/${encodeURIComponent(requestId)}/reply`, { reply }, directory);
-  }
-
-  /** Invalidate direct-server discovery (e.g. after a 401). */
-  resetDirectServer(): void {
-    this.directBase = "";
-    this.directAuth = "";
+  /** Headers for any upstream request (REST and the event stream). */
+  authHeaders(): Record<string, string> {
+    return this.authorization ? { Authorization: this.authorization } : {};
   }
 
   private async request<T>(
     path: string,
-    init: RequestInit & { timeoutMs?: number } = {},
+    init: { method?: string; body?: unknown; timeoutMs?: number } = {},
   ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(),
-      init.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    );
+    const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const method = init.method ?? "GET";
     try {
       const res = await this.fetchImpl(`${this.base}${path}`, {
-        ...init,
+        method,
         signal: controller.signal,
         headers: {
           Accept: "application/json",
-          ...(init.body ? { "Content-Type": "application/json" } : {}),
-          ...init.headers,
+          ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
+          ...this.authHeaders(),
         },
+        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
       });
       if (!res.ok) {
-        throw new Error(`OpenChamber ${init.method ?? "GET"} ${path} -> HTTP ${res.status}`);
+        let detail = "";
+        try {
+          const body = rec(await res.json());
+          detail = typeof body.message === "string" ? `: ${body.message}` : "";
+        } catch {
+          // non-JSON error body
+        }
+        throw new OpenChamberHttpError(`${method} ${path.split("?")[0]} -> HTTP ${res.status}${detail}`, res.status);
       }
       if (res.status === 204) return undefined as T;
       const ct = res.headers.get("content-type") ?? "";
-      if (!ct.includes("json")) {
-        throw new Error(`OpenChamber ${path}: unexpected content-type ${ct || "(none)"}`);
-      }
+      if (!ct.includes("json")) return undefined as T;
       return (await res.json()) as T;
     } finally {
       clearTimeout(timer);
     }
   }
 
-  listSessions(directory?: string): Promise<OcSession[]> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<OcSession[]>(`/api/session${qs}`);
+  // ── sessions ────────────────────────────────────────────
+
+  /** Newest-first root sessions across every location (v2 lists globally). */
+  async listSessions(limit = 50): Promise<OcSession[]> {
+    const qs = new URLSearchParams({ limit: String(limit), order: "desc", parentID: "null" });
+    const rows = unwrapData<unknown[]>(await this.request(`/api/session?${qs.toString()}`));
+    return (Array.isArray(rows) ? rows : []).map(normalizeSession);
   }
 
-  /** Create a new session (defaults to OpenChamber's default directory). */
-  createSession(title?: string, directory?: string): Promise<OcSession> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<OcSession>(`/api/session${qs}`, {
+  async getSession(id: string): Promise<OcSession> {
+    return normalizeSession(unwrapData(await this.request(`/api/session/${encodeURIComponent(id)}`)));
+  }
+
+  /** Create a session; without a directory the server's default location is used. */
+  async createSession(title?: string, directory?: string): Promise<OcSession> {
+    const body: Record<string, unknown> = { title: title ?? "New chat" };
+    if (directory) body.location = { directory };
+    const created = await this.request("/api/session", { method: "POST", body, timeoutMs: 15000 });
+    return normalizeSession(unwrapData(created));
+  }
+
+  /** Map of sessionId -> { type: "running" } for sessions currently executing. */
+  async activeSessions(): Promise<Record<string, { type: string }>> {
+    const data = unwrapData<Record<string, { type: string }>>(await this.request("/api/session/active"));
+    return rec(data) as Record<string, { type: string }>;
+  }
+
+  /** Server default location (used to recognise projectless "chat" sessions). */
+  async defaultDirectory(): Promise<string | undefined> {
+    const loc = rec(await this.request("/api/location"));
+    return typeof loc.directory === "string" ? loc.directory : undefined;
+  }
+
+  async listProjects(): Promise<OcProject[]> {
+    const rows = unwrapData<unknown[]>(await this.request("/api/project"));
+    return (Array.isArray(rows) ? rows : []).map((raw) => {
+      const p = rec(raw);
+      const worktree =
+        typeof p.canonical === "string" ? p.canonical : typeof p.worktree === "string" ? p.worktree : undefined;
+      return {
+        id: String(p.id ?? ""),
+        worktree,
+        sandboxes: Array.isArray(p.sandboxes) ? p.sandboxes.map(String) : [],
+      };
+    });
+  }
+
+  /** Messages oldest-first (fetches the newest `limit`). */
+  async messages(sessionId: string, limit = 100): Promise<OcMessage[]> {
+    const qs = new URLSearchParams({ limit: String(limit), order: "desc" });
+    const rows = unwrapData<OcMessage[]>(
+      await this.request(`/api/session/${encodeURIComponent(sessionId)}/message?${qs.toString()}`),
+    );
+    return (Array.isArray(rows) ? rows : []).slice().reverse();
+  }
+
+  /** Non-blocking prompt: enqueued into the session inbox; output streams as events. */
+  async prompt(sessionId: string, text: string): Promise<void> {
+    await this.request(`/api/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
-      body: JSON.stringify({ title: title ?? "New chat" }),
-      headers: { "Content-Type": "application/json" },
+      body: { text },
       timeoutMs: 15000,
     });
   }
 
-  listProjects(): Promise<Array<{ id: string; worktree?: string; sandboxes?: string[] }>> {
-    return this.request<Array<{ id: string; worktree?: string; sandboxes?: string[] }>>("/api/project");
+  async interrupt(sessionId: string): Promise<void> {
+    await this.request(`/api/session/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
   }
 
-  sessionActivity(): Promise<OcSessionActivity> {
-    return this.request<OcSessionActivity>("/api/session-activity");
+  // ── permissions & forms (ask-user) ─────────────────────
+
+  async pendingPermissions(directory?: string): Promise<OcPermission[]> {
+    const rows = unwrapData<OcPermission[]>(await this.request(`/api/permission/request${locationQuery(directory)}`));
+    return Array.isArray(rows) ? rows : [];
   }
 
-  messages(sessionId: string, directory?: string): Promise<OcMessage[]> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<OcMessage[]>(
-      `/api/session/${encodeURIComponent(sessionId)}/message${qs}`,
+  async pendingForms(directory?: string): Promise<OcForm[]> {
+    const rows = unwrapData<OcForm[]>(await this.request(`/api/form${locationQuery(directory)}`));
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  async replyPermission(sessionId: string, requestId: string, decision: OcPermissionReply): Promise<void> {
+    await this.request(
+      `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
+      { method: "POST", body: { decision } },
     );
   }
 
-  /** Fire-and-forget prompt (204). Streaming arrives via the event stream. */
-  promptAsync(
-    sessionId: string,
-    text: string,
-    directory?: string,
-    model?: { providerID: string; modelID: string },
-    agent?: string,
-  ): Promise<void> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<void>(
-      `/api/session/${encodeURIComponent(sessionId)}/prompt_async${qs}`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          parts: [{ type: "text", text }],
-          ...(model ? { model } : {}),
-          ...(agent ? { agent } : {}),
-        }),
-        headers: { "Content-Type": "application/json" },
-        timeoutMs: 15000,
-      },
-    );
+  async replyForm(sessionId: string, formId: string, answer: Record<string, unknown>): Promise<void> {
+    await this.request(`/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}/reply`, {
+      method: "POST",
+      body: { answer },
+    });
   }
 
-  pendingPermissions(): Promise<OcPermission[]> {
-    return this.request<OcPermission[]>("/api/permission");
-  }
-
-  pendingQuestions(): Promise<OcQuestion[]> {
-    return this.request<OcQuestion[]>("/api/question");
-  }
-
-  replyPermission(
-    sessionId: string,
-    requestId: string,
-    response: "once" | "always" | "reject",
-    directory?: string,
-  ): Promise<void> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<void>(
-      `/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply${qs}`,
-      { method: "POST", body: JSON.stringify({ response }), headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  replyQuestion(
-    sessionId: string,
-    requestId: string,
-    answers: string[],
-    directory?: string,
-  ): Promise<void> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<void>(
-      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reply${qs}`,
-      { method: "POST", body: JSON.stringify({ answers }), headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  rejectQuestion(sessionId: string, requestId: string, directory?: string): Promise<void> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<void>(
-      `/api/session/${encodeURIComponent(sessionId)}/question/${encodeURIComponent(requestId)}/reject${qs}`,
-      { method: "POST", body: JSON.stringify({}) },
-    );
-  }
-
-  interrupt(sessionId: string, directory?: string): Promise<void> {
-    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : "";
-    return this.request<void>(
-      `/api/session/${encodeURIComponent(sessionId)}/interrupt${qs}`,
-      { method: "POST", body: JSON.stringify({}) },
-    );
+  async cancelForm(sessionId: string, formId: string): Promise<void> {
+    await this.request(`/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formId)}`, {
+      method: "DELETE",
+    });
   }
 }

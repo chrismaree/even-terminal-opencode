@@ -1,15 +1,19 @@
-// Pure translation layer: opencode bus events + REST shapes -> even-terminal
+// Pure translation layer: opencode v2 bus events + REST shapes -> even-terminal
 // messages. No I/O — fully unit-testable.
 
 import type { EvenMessage, EvenSession, HistoryItem } from "./types.ts";
 import type {
+  OcForm,
+  OcFormField,
   OcMessage,
   OcPermission,
-  OcQuestion,
+  OcPermissionReply,
+  OcProject,
   OcSession,
-  OcSessionActivity,
 } from "./openchamber.ts";
 import type { UpstreamEvent } from "./sse.ts";
+
+export type { OcProject } from "./openchamber.ts";
 
 function str(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -19,15 +23,22 @@ function rec(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
+/** Question bookkeeping kept per pending ask so ring answers map back to form fields. */
+export interface AskQuestion {
+  question: string;
+  header?: string;
+  field?: OcFormField;
+}
+
 /** One translated upstream event, with optional ask/reply bookkeeping. */
 export interface Translated {
   sessionId: string;
   msg: EvenMessage;
-  ask?: { kind: "permission" | "question"; requestId: string; questions: Array<{ question?: string; header?: string }> };
+  ask?: { kind: "permission" | "question"; requestId: string; questions: AskQuestion[] };
   reply?: { kind: "permission" | "question"; requestId: string };
 }
 
-function trimMap(map: Map<string, string>, max: number): void {
+function trimMap<K, V>(map: Map<K, V>, max: number): void {
   while (map.size > max) {
     const first = map.keys().next().value;
     if (first === undefined) break;
@@ -42,11 +53,6 @@ function capText(text: string, max: number): string {
 function basename(path: string): string {
   const parts = path.replace(/\/+$/, "").split("/");
   return parts[parts.length - 1] ?? "";
-}
-
-/** Last path segment, like upstream's summary-format fileName(). */
-function fileName(path: string): string {
-  return basename(path);
 }
 
 /** Longest label length that fits the glasses list comfortably. */
@@ -66,8 +72,7 @@ export function abbrevLabel(label: string, max = MAX_LABEL_LEN): string {
   return `${label.slice(0, Math.max(1, max - 1))}…`;
 }
 
-/** Tool parts emit tool_start once and tool_end on completion. In the default
- *  quiet mode, read-only tools are hidden entirely and action tools get
+/** In quiet mode, read-only tools are hidden entirely and action tools get
  *  compact single-line summaries (mirroring upstream's glasses style). */
 const QUIET_TOOLS = new Set([
   "read",
@@ -81,56 +86,72 @@ const QUIET_TOOLS = new Set([
   "todoread",
   "todowrite",
   "toolsearch",
+  "skill",
   "question",
   "ask",
   "askuserquestion",
 ]);
 
-function toolSummary(name: string, state: Record<string, unknown>): string {
-  const input = rec(state.input);
-  const title = str(state.title);
+const TODO_TOOLS = new Set(["todowrite", "todo"]);
+
+function filePathOf(input: Record<string, unknown>): string {
+  return str(input.path) || str(input.filePath) || str(input.file_path);
+}
+
+/** One-line tool summary from the tool name + its input (v2 tool names). */
+export function toolSummary(name: string, input: Record<string, unknown>): string {
   switch (name.toLowerCase()) {
+    case "shell":
     case "bash": {
       const cmd = str(input.command).split("\n")[0] ?? "";
-      return capText(cmd || title, 50) || "command";
+      return capText(cmd, 50) || "command";
     }
     case "edit":
-    case "write":
     case "patch": {
-      const file = fileName(str(input.filePath) || str(input.file_path) || str(state.title));
-      if (name.toLowerCase() === "edit" || name.toLowerCase() === "patch") {
-        const added = str(input.newString || input.new_string).split("\n").length;
-        const removed = str(input.oldString || input.old_string).split("\n").length;
-        const delta = (input.newString ? added : 0) - (input.oldString ? removed : 0);
-        return file + (delta > 0 ? ` +${delta}` : delta < 0 ? ` ${delta}` : "");
-      }
-      return file;
+      const file = basename(filePathOf(input));
+      const added = str(input.newString || input.new_string).split("\n").length;
+      const removed = str(input.oldString || input.old_string).split("\n").length;
+      const delta = (input.newString ? added : 0) - (input.oldString ? removed : 0);
+      return (file || name) + (delta > 0 ? ` +${delta}` : delta < 0 ? ` ${delta}` : "");
     }
-    case "webfetch": {
-      const url = str(input.url || input.url_);
-      return url.replace(/^https?:\/\//, "").slice(0, 50);
-    }
+    case "write":
+      return basename(filePathOf(input)) || "write";
+    case "read":
+      return basename(filePathOf(input)) || "read";
+    case "grep":
+    case "glob":
+      return capText(str(input.pattern), 50) || name;
+    case "webfetch":
+      return str(input.url).replace(/^https?:\/\//, "").slice(0, 50) || "webfetch";
+    case "websearch":
+      return capText(str(input.query), 50) || "websearch";
     case "task":
-      return capText(str(input.description) || title, 50) || "agent";
-    default: {
-      const title2 = title || str(input.description) || name;
-      return capText(title2, 50);
-    }
+    case "subagent":
+      return capText(str(input.description), 50) || "agent";
+    case "skill":
+      return str(input.id) || "skill";
+    default:
+      return capText(str(input.description) || str(input.action) || name, 50);
   }
 }
 
-/** Keep detail payloads tiny: bash keeps its command, everything else drops input. */
-function toolDetailInput(name: string, state: Record<string, unknown>): string | undefined {
-  const input = rec(state.input);
-  if (name.toLowerCase() === "bash") return capText(str(input.command), 120) || undefined;
+/** Keep detail payloads tiny: shell keeps its command, everything else drops input. */
+function toolDetailInput(name: string, input: Record<string, unknown>): string | undefined {
+  const n = name.toLowerCase();
+  if (n === "shell" || n === "bash") return capText(str(input.command), 120) || undefined;
   return undefined;
 }
 
-// ── Event stream translation ─────────────────────────────
+function toolOutputText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((c) => str(rec(c).text))
+    .filter(Boolean)
+    .join("\n");
+}
 
-/** TodoWrite tool input -> glasses progress bar (pure extraction). */
-export function taskProgressFromTodos(state: Record<string, unknown>): EvenMessage | null {
-  const input = rec(state.input);
+/** Todo tool input -> glasses progress bar (pure extraction). */
+export function taskProgressFromTodos(input: Record<string, unknown>): EvenMessage | null {
   const todos = Array.isArray(input.todos) ? input.todos : [];
   if (todos.length === 0) return null;
   let completed = 0;
@@ -145,144 +166,126 @@ export function taskProgressFromTodos(state: Record<string, unknown>): EvenMessa
   return { type: "task_progress", completed, total: todos.length, current };
 }
 
+interface ToolTrack {
+  name: string;
+  input: Record<string, unknown>;
+  started: boolean;
+}
+
 // ── Event stream translation ─────────────────────────────
 
 /**
- * Tracks per-part text so `message.part.updated`/`message.part.delta` events
- * can be turned into append-only deltas; reasoning parts become thinking
- * states; user messages never stream. Bounded memory.
+ * Translates opencode v2 session events into glasses messages. Text arrives as
+ * `session.text.delta`; reasoning drives the thinking indicator; tools are
+ * paired by tool id. Bounded memory.
  */
 export class OpencodeEventTranslator {
-  /** `${sessionId}:${messageId}:${partId}` -> last emitted text */
-  private lastText = new Map<string, string>();
-  /** `${sessionId}:${callID}` -> tool name (for tool_end pairing) */
-  private toolNames = new Map<string, string>();
-  /** `${sessionId}:${messageId}:${partId}` -> part type (text vs reasoning vs tool) */
-  private partTypes = new Map<string, string>();
-  /** messageID -> role, so the user's own messages don't stream as text */
-  private messageRoles = new Map<string, string>();
-  /** per-session open render block: "thinking" | "text" */
+  /** `${sessionId}:${assistantMessageID}:${ordinal}` -> text streamed so far */
+  private streamed = new Map<string, string>();
+  /** `${sessionId}:${toolId}` -> tool name/input/start-emitted */
+  private tools = new Map<string, ToolTrack>();
+  /** per-session open render block */
   private blockState = new Map<string, "thinking" | "text">();
-
-  constructor(fallbackSessionId = "", verboseTools = false) {
-    this.fallbackSessionId = fallbackSessionId;
-    this.verboseTools = verboseTools;
-  }
-  private readonly fallbackSessionId: string;
-  /** emit tool cards for read-only tools too (default: quiet) */
   private readonly verboseTools: boolean;
 
+  constructor(verboseTools = false) {
+    this.verboseTools = verboseTools;
+  }
+
   /** Translate one upstream event into 0..n even-terminal messages. */
-  translate(event: UpstreamEvent): Array<Translated> {
-    const props = event.properties ?? {};
+  translate(event: UpstreamEvent): Translated[] {
+    const d = event.data;
+    const sessionId = str(d.sessionID);
     switch (event.type) {
-      case "message.part.updated":
-        return this.partUpdated(props);
-      case "message.part.delta":
-        return this.partDelta(props);
-      case "message.updated": {
-        const info = rec(props.info);
-        const mid = str(info.id);
-        const role = str(info.role);
-        if (mid && role) this.messageRoles.set(mid, role);
-        return [];
-      }
-      case "session.status": {
-        const sessionId = str(props.sessionID) || this.fallbackSessionId;
-        const status = rec(props.status);
-        const state = str(status.type);
-        if (state === "busy") {
-          return [{ sessionId, msg: { type: "status", state: "busy", sessionId } }];
-        }
-        if (state === "idle") {
-          return [{ sessionId, msg: { type: "status", state: "idle", sessionId } }];
-        }
-        if (state === "retry") {
-          const attempt = status.attempt;
-          const attemptStr =
-            typeof attempt === "number" || typeof attempt === "string" ? String(attempt) : "";
-          return [
-            {
-              sessionId,
-              msg: {
-                type: "notification",
-                title: "Retrying",
-                message: attemptStr ? `Retrying (attempt ${attemptStr})…` : "Retrying…",
-              },
-            },
-          ];
-        }
-        return [];
-      }
-      case "session.error": {
-        const sessionId = str(props.sessionID) || this.fallbackSessionId;
+      case "session.execution.started":
+        return sessionId ? [{ sessionId, msg: { type: "status", state: "busy", sessionId } }] : [];
+      case "session.execution.succeeded":
+      case "session.execution.interrupted":
+      case "session.idle":
+        return sessionId ? [{ sessionId, msg: { type: "status", state: "idle", sessionId } }] : [];
+      case "session.execution.failed": {
         if (!sessionId) return [];
-        const err = rec(props.error);
-        const message = str(err.message) || str(props.error) || "Agent error";
-        return [{ sessionId, msg: { type: "error", message: capText(message, 200) } }];
+        const message = str(rec(d.error).message) || "Agent error";
+        return [
+          { sessionId, msg: { type: "error", message: capText(message, 200) } },
+          { sessionId, msg: { type: "status", state: "idle", sessionId } },
+        ];
       }
-      case "session.idle": {
-        const sessionId = str(props.sessionID) || this.fallbackSessionId;
-        return [{ sessionId, msg: { type: "status", state: "idle", sessionId } }];
+      case "session.retry.scheduled": {
+        if (!sessionId) return [];
+        const attempt = typeof d.attempt === "number" ? ` (attempt ${d.attempt})` : "";
+        const reason = str(rec(d.error).message);
+        return [
+          {
+            sessionId,
+            msg: { type: "notification", title: "Retrying", message: capText(`Retrying${attempt}… ${reason}`.trim(), 120) },
+          },
+        ];
       }
-      case "question.asked":
-        return this.questionAsked(props);
+      case "session.text.started":
+        return sessionId ? this.textTransition(sessionId) : [];
+      case "session.text.delta":
+        return this.textDelta(sessionId, d);
+      case "session.text.ended":
+        return this.textEnded(sessionId, d);
+      case "session.reasoning.started":
+      case "session.reasoning.delta":
+        return sessionId ? this.thinkTransition(sessionId, true) : [];
+      case "session.reasoning.ended":
+        return sessionId ? this.thinkTransition(sessionId, false) : [];
+      case "session.tool.input.started":
+        return this.toolInputStarted(sessionId, d);
+      case "session.tool.called":
+        return this.toolCalled(sessionId, d);
+      case "session.tool.success":
+      case "session.tool.failed":
+        return this.toolFinished(sessionId, d, event.type === "session.tool.failed");
       case "permission.asked":
-        return this.permissionAsked(props);
-      case "question.replied":
-      case "question.rejected":
-        return this.replied(props, "question");
+        return this.permissionAsked(d);
       case "permission.replied":
-        return this.replied(props, "permission");
+        return this.replied(sessionId, str(d.requestID), "permission");
+      case "form.created":
+        return this.formCreated(d);
+      case "form.replied":
+      case "form.cancelled":
+        return this.replied(sessionId, str(d.id), "question");
       default:
         return [];
     }
   }
 
-  /** Incremental text streaming (current opencode). */
-  private partDelta(props: Record<string, unknown>): Array<Translated> {
-    const sessionId = str(props.sessionID) || this.fallbackSessionId;
+  private textDelta(sessionId: string, d: Record<string, unknown>): Translated[] {
+    const delta = str(d.delta);
+    if (!sessionId || !delta) return [];
+    const key = `${sessionId}:${str(d.assistantMessageID)}:${String(d.ordinal ?? 0)}`;
+    this.streamed.set(key, (this.streamed.get(key) ?? "") + delta);
+    return this.textTransition(sessionId, delta);
+  }
+
+  /** On text end, emit whatever was not streamed (e.g. bridge connected mid-block). */
+  private textEnded(sessionId: string, d: Record<string, unknown>): Translated[] {
     if (!sessionId) return [];
-    const messageId = str(props.messageID);
-    const partId = str(props.partID);
-    const partType = this.partTypes.get(`${sessionId}:${messageId}:${partId}`);
-
-    // model chain-of-thought: suppress the raw text, show the thinking indicator
-    if (partType === "reasoning") return this.thinkTransition(sessionId, true);
-    if (partType && partType !== "text") return []; // step markers etc. carry no renderable text
-
-    if (this.messageRoles.get(messageId) === "user") return [];
-    const field = str(props.field) || "text";
-    if (field !== "text") return []; // tool-state deltas arrive as full part updates
-    const delta = str(props.delta);
-    if (!delta) return [];
-
-    const out: Array<{ sessionId: string; msg: EvenMessage }> = [];
-    out.push(...this.textTransition(sessionId));
-    const key = `${sessionId}:${messageId}:${partId}`;
-    const next = (this.lastText.get(key) ?? "") + delta;
-    this.lastText.set(key, next);
-    out.push({ sessionId, msg: { type: "text_delta", text: delta } });
-    return out;
+    const key = `${sessionId}:${str(d.assistantMessageID)}:${String(d.ordinal ?? 0)}`;
+    const full = str(d.text);
+    const prev = this.streamed.get(key) ?? "";
+    this.streamed.delete(key);
+    if (!full || full === prev) return [];
+    const rest = full.startsWith(prev) ? full.slice(prev.length) : prev ? "" : full;
+    return rest ? this.textTransition(sessionId, rest) : [];
   }
 
   /** Entering/leaving a thinking block. */
-  private thinkTransition(
-    sessionId: string,
-    entering: boolean,
-  ): Array<{ sessionId: string; msg: EvenMessage }> {
+  private thinkTransition(sessionId: string, entering: boolean): Translated[] {
     const current = this.blockState.get(sessionId);
-    const out: Array<{ sessionId: string; msg: EvenMessage }> = [];
+    const out: Translated[] = [];
     if (entering) {
       if (current === "thinking") return [];
-      if (current === "text") {
-        out.push({ sessionId, msg: { type: "status", state: "text_end", sessionId } });
-      }
+      if (current === "text") out.push({ sessionId, msg: { type: "status", state: "text_end", sessionId } });
       this.blockState.set(sessionId, "thinking");
       out.push({ sessionId, msg: { type: "status", state: "think_start", sessionId } });
       return out;
     }
-    if (this.blockState.get(sessionId) === "thinking") {
+    if (current === "thinking") {
       this.blockState.delete(sessionId);
       return [{ sessionId, msg: { type: "status", state: "think_end", sessionId } }];
     }
@@ -290,11 +293,8 @@ export class OpencodeEventTranslator {
   }
 
   /** Entering (or continuing) a text block. */
-  private textTransition(
-    sessionId: string,
-    delta?: string,
-  ): Array<{ sessionId: string; msg: EvenMessage }> {
-    const out: Array<{ sessionId: string; msg: EvenMessage }> = [];
+  private textTransition(sessionId: string, delta?: string): Translated[] {
+    const out: Translated[] = [];
     if (this.blockState.get(sessionId) === "thinking") {
       out.push({ sessionId, msg: { type: "status", state: "think_end", sessionId } });
     }
@@ -306,186 +306,129 @@ export class OpencodeEventTranslator {
     return out;
   }
 
-  /** Close any open block (on tool start, step finish, or idle). */
-  closeBlock(sessionId: string): Array<{ sessionId: string; msg: EvenMessage }> {
+  /** Close any open block (on tool start or idle). */
+  closeBlock(sessionId: string): Translated[] {
     const current = this.blockState.get(sessionId);
     if (!current) return [];
     this.blockState.delete(sessionId);
-    return [
-      { sessionId, msg: { type: "status", state: current === "thinking" ? "think_end" : "text_end", sessionId } },
-    ];
+    return [{ sessionId, msg: { type: "status", state: current === "thinking" ? "think_end" : "text_end", sessionId } }];
   }
 
-  private partUpdated(props: Record<string, unknown>): Array<Translated> {
-    const part = rec(props.part);
-    const sessionId = str(part.sessionID) || str(props.sessionID) || this.fallbackSessionId;
-    if (!sessionId) return [];
-    const messageId = str(part.messageID) || str(props.messageID);
-    const partId = str(part.id) || messageId;
-    const type = str(part.type);
+  private isQuiet(name: string): boolean {
+    return !this.verboseTools && QUIET_TOOLS.has(name.toLowerCase());
+  }
 
-    // remember the part's type so part.delta events (which only carry ids)
-    // can tell assistant text from model reasoning
-    this.partTypes.set(`${sessionId}:${messageId}:${partId}`, type);
+  private toolInputStarted(sessionId: string, d: Record<string, unknown>): Translated[] {
+    const toolId = str(d.id);
+    if (!sessionId || !toolId) return [];
+    const name = str(d.name) || "tool";
+    const key = `${sessionId}:${toolId}`;
+    const blockClose = this.closeBlock(sessionId);
+    const quiet = this.isQuiet(name);
+    this.tools.set(key, { name, input: {}, started: !quiet });
+    if (quiet) return blockClose;
+    return [...blockClose, { sessionId, msg: { type: "tool_start", name, toolId } }];
+  }
 
-    if (type === "text") {
-      // the user's own message parts stream like text parts; the bridge
-      // already echoes prompts via user_prompt — never re-render them
-      if (this.messageRoles.get(messageId) === "user") return [];
-      const text = str(part.text);
-      const key = `${sessionId}:${messageId}:${partId}`;
-      const prev = this.lastText.get(key) ?? "";
-      if (text === prev) return [];
-      const delta = text.startsWith(prev) ? text.slice(prev.length) : text;
-      this.lastText.set(key, text);
-      return this.textTransition(sessionId, delta);
-    }
-
-    if (type === "reasoning") {
-      // model chain-of-thought: never stream as text; drive the "thinking…"
-      // indicator instead (mirrors upstream's content-block states)
-      return this.thinkTransition(sessionId, true);
-    }
-
-    if (type === "tool") {
-      this.partTypes.set(`${sessionId}:${messageId}:${partId}`, type);
-      const state = rec(part.state);
-      const callId = str(part.callID) || `${messageId}:${partId}`;
-      const name = str(part.tool) || "tool";
-      const status = str(state.status);
-      const tKey = `${sessionId}:${callId}`;
-      // a tool call always ends any open text/think block on the glasses
-      const blockClose = this.closeBlock(sessionId);
-      // Verbose mode emits every tool; quiet mode hides the read-only herd.
-      if (!this.verboseTools && QUIET_TOOLS.has(name.toLowerCase())) {
-        // keep bookkeeping so completion never emits a late start/end pair
-        if (status === "pending" || status === "running") this.toolNames.set(tKey, name);
-        else this.toolNames.delete(tKey);
-        // todos still drive the progress bar even with the card hidden
-        if (name.toLowerCase() === "todowrite" && (status === "completed" || status === "error")) {
-          const progress = taskProgressFromTodos(state);
-          return [...blockClose, ...(progress ? [{ sessionId, msg: progress }] : [])];
-        }
-        return blockClose;
-      }
-      if (status === "pending" || status === "running") {
-        if (!this.toolNames.has(tKey)) {
-          this.toolNames.set(tKey, name);
-          return [...blockClose, { sessionId, msg: { type: "tool_start", name, toolId: callId } }];
-        }
-        return [];
-      }
-      if (status === "completed" || status === "error") {
-        const known = this.toolNames.has(tKey);
-        this.toolNames.delete(tKey);
-        const start = known ? [] : [{ sessionId, msg: { type: "tool_start", name, toolId: callId } as EvenMessage }];
-        const progress =
-          name.toLowerCase() === "todowrite" ? taskProgressFromTodos(state) : null;
-        const end: EvenMessage = {
-          type: "tool_end",
-          name,
-          toolId: callId,
-          summary: toolSummary(name, state),
-          // quiet mode keeps cards to a single line; detail is verbose-only
-          ...(this.verboseTools
-            ? { detail: { input: toolDetailInput(name, state), output: capText(str(state.output), 200) } }
-            : {}),
-        };
-        const out: Array<{ sessionId: string; msg: EvenMessage }> = [
-          ...start,
-          { sessionId, msg: end },
-        ];
-        if (progress) out.push({ sessionId, msg: progress });
-        return out;
-      }
-    }
+  private toolCalled(sessionId: string, d: Record<string, unknown>): Translated[] {
+    const toolId = str(d.id);
+    if (!sessionId || !toolId) return [];
+    const key = `${sessionId}:${toolId}`;
+    const track = this.tools.get(key) ?? { name: "tool", input: {}, started: false };
+    track.input = rec(d.input);
+    this.tools.set(key, track);
     return [];
   }
 
+  private toolFinished(sessionId: string, d: Record<string, unknown>, failed: boolean): Translated[] {
+    const toolId = str(d.id);
+    if (!sessionId || !toolId) return [];
+    const key = `${sessionId}:${toolId}`;
+    const track = this.tools.get(key) ?? { name: "tool", input: {}, started: false };
+    this.tools.delete(key);
+    const { name, input } = track;
+    const progress = TODO_TOOLS.has(name.toLowerCase()) ? taskProgressFromTodos(input) : null;
+    if (this.isQuiet(name)) return progress ? [{ sessionId, msg: progress }] : [];
+
+    const out: Translated[] = [];
+    if (!track.started) {
+      out.push(...this.closeBlock(sessionId));
+      out.push({ sessionId, msg: { type: "tool_start", name, toolId } });
+    }
+    const errorText = failed ? str(rec(d.error).message) : "";
+    const summary = toolSummary(name, input) + (failed ? " ✗" : "");
+    out.push({
+      sessionId,
+      msg: {
+        type: "tool_end",
+        name,
+        toolId,
+        summary,
+        // quiet mode keeps cards to a single line; detail is verbose-only
+        ...(this.verboseTools
+          ? {
+              detail: {
+                input: toolDetailInput(name, input),
+                output: capText(errorText || toolOutputText(d.content), 200),
+              },
+            }
+          : {}),
+      },
+    });
+    if (progress) out.push({ sessionId, msg: progress });
+    return out;
+  }
 
   /** Bound memory: drop the oldest tracked entries when over budget. */
   prune(maxParts = 512, maxTools = 128): void {
-    trimMap(this.lastText, maxParts);
-    trimMap(this.toolNames, maxTools);
-    trimMap(this.partTypes, maxParts);
+    trimMap(this.streamed, maxParts);
+    trimMap(this.tools, maxTools);
     trimMap(this.blockState, 64);
   }
 
-  private questionAsked(props: Record<string, unknown>): Array<Translated> {
-    const sessionId = str(props.sessionID) || this.fallbackSessionId;
-    if (!sessionId) return [];
-    const questions = Array.isArray(props.questions) ? props.questions : [];
-    if (questions.length === 0) return [];
-    const requestId = str(props.id) || str(props.requestID);
+  private permissionAsked(d: Record<string, unknown>): Translated[] {
+    const p = d as unknown as OcPermission;
+    const sessionId = str(p.sessionID);
+    const requestId = str(p.id);
+    if (!sessionId || !requestId) return [];
     return [
       {
         sessionId,
-        msg: {
-          type: "user_question",
-          toolUseId: requestId,
-          questions: questions.map((q) => {
-            const entry = rec(q);
-            return {
-              question: str(entry.question),
-              header: str(entry.header),
-              options: (Array.isArray(entry.options) ? entry.options : []).map((o) => {
-                const opt = rec(o);
-                return { label: str(opt.label), description: str(opt.description), preview: "" };
-              }),
-            };
-          }),
-        },
-        ask: {
-          kind: "question",
-          requestId,
-          questions: questions.map((q) => {
-            const entry = rec(q);
-            return { question: str(entry.question), header: str(entry.header) };
-          }),
-        },
-      },
-    ];
-  }
-
-  private permissionAsked(props: Record<string, unknown>): Array<Translated> {
-    const sessionId = str(props.sessionID) || this.fallbackSessionId;
-    if (!sessionId) return [];
-    const permission = rec(props.permission);
-    const p = Object.keys(permission).length > 0 ? permission : props;
-    const requestId = str(p.id) || str(props.id);
-    if (!requestId) return [];
-    return [
-      {
-        sessionId,
-        msg: permissionRequestMessage(p as unknown as OcPermission),
+        msg: permissionRequestMessage(p),
         ask: { kind: "permission", requestId, questions: [] },
       },
     ];
   }
 
+  private formCreated(d: Record<string, unknown>): Translated[] {
+    const form = rec(d.form) as unknown as OcForm;
+    const sessionId = str(form.sessionID);
+    const requestId = str(form.id);
+    if (!sessionId || !requestId) return [];
+    const msg = formQuestionMessage(form);
+    if (!msg) return [];
+    return [{ sessionId, msg, ask: { kind: "question", requestId, questions: formAskQuestions(form) } }];
+  }
+
   /** A pending ask was answered elsewhere (OpenChamber UI / auto-accept). */
-  private replied(
-    props: Record<string, unknown>,
-    kind: "permission" | "question",
-  ): Array<Translated> {
-    const sessionId = str(props.sessionID) || this.fallbackSessionId;
+  private replied(sessionId: string, requestId: string, kind: "permission" | "question"): Translated[] {
+    if (!requestId) return [];
     return [
       {
         sessionId,
         msg: {
           type: "notification",
-          message:
-            kind === "question"
-              ? "Question timed out or answered elsewhere"
-              : "Permission handled outside the glasses",
+          message: kind === "question" ? "Question answered elsewhere" : "Permission handled outside the glasses",
         },
-        reply: { kind, requestId: str(props.requestID) || str(props.id) },
+        reply: { kind, requestId },
       },
     ];
   }
 }
 
 // ── REST shape mapping ───────────────────────────────────
+
+const IGNORED_TITLE = /^(New session|Untitled|session) - /;
 
 /** Root, non-archived, titled sessions sorted by most recent update. */
 export function visibleRootSessions(list: OcSession[]): OcSession[] {
@@ -495,10 +438,8 @@ export function visibleRootSessions(list: OcSession[]): OcSession[] {
     .sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
 }
 
-const IGNORED_TITLE = /^(New session|Untitled|session) - /;
-
 export function toEvenSession(s: OcSession, label?: string): EvenSession {
-  const base = (s.title ?? s.id).trim();
+  const base = (s.title || s.id).trim();
   const title = label ? `${label} · ${base}` : base;
   return {
     id: s.id,
@@ -516,31 +457,31 @@ export function sessionState(
   hasPendingAsk: boolean,
 ): string {
   if (hasPendingAsk) return "awaiting";
-  return activity[sessionId]?.type === "busy" ? "busy" : "idle";
+  const t = activity[sessionId]?.type;
+  return t === "running" || t === "busy" ? "busy" : "idle";
 }
 
-export interface HistoryRow {
-  role: string;
-  text: string;
-}
-
-/** Flatten messages into terminal-style history rows, newest last. */
-export function toHistoryRows(messages: OcMessage[], limit: number, maxChars = 4000): HistoryRow[] {
-  const rows: HistoryRow[] = [];
+/** Flatten v2 messages into terminal-style history rows, newest last. */
+export function toHistoryRows(messages: OcMessage[], limit: number, maxChars = 4000): HistoryItem[] {
+  const rows: HistoryItem[] = [];
   for (const m of messages) {
-    const isUser = m.info.role === "user";
-    for (const part of m.parts) {
-      if (part.type === "text") {
-        const text = (part.text ?? "").trim();
-        if (!text) continue;
-        rows.push({ role: m.info.role, text: (isUser ? "you: " : "") + text.trim() });
-      } else if (part.type === "tool") {
-        const state = rec(part.state);
-        rows.push({ role: "tool", text: "> " + (str(state.title) || str(part.tool) || "working") });
+    if (m.type === "user") {
+      const text = (m.text ?? "").trim();
+      if (text) rows.push({ role: "user", text: `you: ${text}` });
+    } else if (m.type === "assistant") {
+      for (const c of m.content ?? []) {
+        if (c.type === "text") {
+          const text = c.text.trim();
+          if (text) rows.push({ role: "assistant", text });
+        } else if (c.type === "tool") {
+          rows.push({ role: "tool", text: `> ${c.name}: ${toolSummary(c.name, rec(c.state?.input))}` });
+        }
       }
+    } else if (m.type === "shell" && m.command) {
+      rows.push({ role: "tool", text: `> $ ${capText(m.command, 80)}` });
     }
   }
-  const out: HistoryRow[] = [];
+  const out: HistoryItem[] = [];
   let used = 0;
   for (let i = rows.length - 1; i >= 0 && out.length < limit; i--) {
     used += rows[i]!.text.length + 1;
@@ -552,9 +493,7 @@ export function toHistoryRows(messages: OcMessage[], limit: number, maxChars = 4
 
 // ── Permissions & questions ──────────────────────────────
 
-export function buildPermissionOptions(
-  alwaysLabel = "Yes, and always allow",
-): Array<{ text: string; key: string }> {
+export function buildPermissionOptions(alwaysLabel = "Yes, and always allow"): Array<{ text: string; key: string }> {
   return [
     { text: "Yes", key: "allow" },
     { text: alwaysLabel, key: "allowAlways" },
@@ -562,47 +501,67 @@ export function buildPermissionOptions(
   ];
 }
 
-/** Pending permission -> permission_request message for the glasses. */
+/** Pending v2 permission request -> permission_request message for the glasses. */
 export function permissionRequestMessage(p: OcPermission): EvenMessage {
-  const meta = rec(p.metadata);
-  const rawPattern = p.pattern ?? meta.pattern ?? p.patterns ?? meta.patterns;
-  const patterns = Array.isArray(rawPattern) ? rawPattern.map((x) => String(x)) : rawPattern ? [String(rawPattern)] : [];
-  const toolName = str(p.type) || "permission";
-  const title = str(p.title) || toolName;
+  const action = str(p.action) || "permission";
+  const resources = Array.isArray(p.resources) ? p.resources.map(String) : [];
+  const description = str(p.message) || (resources[0] ? `${action}: ${capText(resources[0], 60)}` : action);
   return {
     type: "permission_request",
-    toolName,
-    description: title,
-    detail: patterns.join(", ").slice(0, 200),
+    toolName: action,
+    description,
+    detail: resources.join(", ").slice(0, 200),
     toolUseId: str(p.id),
     options: buildPermissionOptions(),
     suggestions: null,
   };
 }
 
-/** Map an app decision ("allow" | "allowAlways" | "deny") to opencode's response verb. */
-export function decisionToResponse(decision: string): "once" | "always" | "reject" {
+/** Map an app decision ("allow" | "allowAlways" | "deny") to opencode's reply verb. */
+export function decisionToResponse(decision: string): OcPermissionReply {
   if (decision === "allowAlways") return "always";
   if (decision === "allow") return "once";
   return "reject";
 }
 
-/** Pending question -> user_question message for the glasses. */
-export function questionMessage(q: OcQuestion): EvenMessage | null {
-  const questions = Array.isArray(q.questions) ? q.questions : [];
-  if (questions.length === 0) return null;
+function askableFields(form: OcForm): OcFormField[] {
+  return (Array.isArray(form.fields) ? form.fields : []).filter((f) => !f.hidden && f.type !== "external");
+}
+
+function fieldOptions(field: OcFormField): Array<{ label: string; description: string; preview: string }> {
+  if (field.type === "boolean") {
+    return [
+      { label: "Yes", description: "", preview: "" },
+      { label: "No", description: "", preview: "" },
+    ];
+  }
+  return (field.options ?? []).map((o) => ({ label: str(o.label) || str(o.value), description: str(o.description), preview: "" }));
+}
+
+/** Question text per askable form field (unique, so JSON answer maps stay unambiguous). */
+export function formAskQuestions(form: OcForm): AskQuestion[] {
+  const fields = askableFields(form);
+  const seen = new Set<string>();
+  return fields.map((field) => {
+    let question = str(field.title) || str(field.description) || str(form.title) || field.key;
+    if (seen.has(question)) question = `${question} (${field.key})`;
+    seen.add(question);
+    return { question, header: fields.length > 1 || field.title ? str(form.title) : "", field };
+  });
+}
+
+/** v2 form (ask-user) -> user_question message for the glasses. */
+export function formQuestionMessage(form: OcForm): EvenMessage | null {
+  const asks = formAskQuestions(form);
+  if (asks.length === 0) return null;
   return {
     type: "user_question",
-    questions: questions.map((entry) => ({
-      question: str(entry.question),
-      header: str(entry.header),
-      options: (entry.options ?? []).map((o) => ({
-        label: str(o.label),
-        description: str(o.description),
-        preview: "",
-      })),
+    questions: asks.map((a) => ({
+      question: a.question,
+      header: a.header ?? "",
+      options: a.field ? fieldOptions(a.field) : [],
     })),
-    toolUseId: str(q.id),
+    toolUseId: str(form.id),
   };
 }
 
@@ -610,10 +569,7 @@ export function questionMessage(q: OcQuestion): EvenMessage | null {
  * The app replies with either plain text (first question) or a JSON map of
  * {questionOrHeader: label}. Normalize to ordered answer strings.
  */
-export function parseQuestionAnswer(
-  answer: string,
-  questions: Array<{ question?: string; header?: string }>,
-): string[] {
+export function parseQuestionAnswer(answer: string, questions: Array<{ question?: string; header?: string }>): string[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(answer.trim());
@@ -623,60 +579,86 @@ export function parseQuestionAnswer(
   if (parsed !== undefined && parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
     const map = parsed as Record<string, unknown>;
     return questions.map((q) => {
-      const key = q.question ?? q.header ?? "";
-      const value = map[key];
+      const value = map[q.question ?? ""] ?? map[q.header ?? ""];
       return typeof value === "string" ? value : "";
     });
   }
-  const plain = answer.trim();
   if (Array.isArray(parsed)) return parsed.map((a) => String(a));
+  const plain = answer.trim();
   return questions.map(() => plain);
+}
+
+function optionValue(field: OcFormField, label: string): string {
+  const needle = label.trim().toLowerCase();
+  const hit = (field.options ?? []).find(
+    (o) => str(o.label).toLowerCase() === needle || str(o.value).toLowerCase() === needle,
+  );
+  return hit ? hit.value : label.trim();
+}
+
+/** Ordered app answers (labels or free text) -> v2 `Form.Reply.answer` keyed by field. */
+export function formAnswerFromLabels(asks: AskQuestion[], answers: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  asks.forEach((ask, i) => {
+    const field = ask.field;
+    const raw = (answers[i] ?? "").trim();
+    if (!field || !raw) return;
+    switch (field.type) {
+      case "boolean":
+        out[field.key] = /^(y|yes|true|ok|allow)$/i.test(raw);
+        break;
+      case "number":
+      case "integer": {
+        const n = Number(raw);
+        if (Number.isFinite(n)) out[field.key] = field.type === "integer" ? Math.round(n) : n;
+        break;
+      }
+      case "multiselect":
+        out[field.key] = raw
+          .split(/\s*,\s*/)
+          .filter(Boolean)
+          .map((label) => optionValue(field, label));
+        break;
+      default:
+        out[field.key] = optionValue(field, raw);
+    }
+  });
+  return out;
 }
 
 /** Last assistant text of a message list (for the result message on idle). */
 export function lastAssistantText(messages: OcMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.info.role !== "assistant") continue;
-    const text = m.parts
-      .filter((p) => p.type === "text" && p.text?.trim())
-      .map((p) => p.text!.trim())
+    if (m.type === "user") break; // don't reach into the previous turn
+    if (m.type !== "assistant") continue;
+    const text = (m.content ?? [])
+      .filter((c): c is { type: "text"; text: string } => c.type === "text" && !!c.text?.trim())
+      .map((c) => c.text.trim())
       .join("\n");
     if (text) return text;
   }
   return "";
 }
 
-/** Turn stats from the tail of a message list (assistant messages only). */
+/** Turn stats summed over assistant steps since the last user message. */
 export function lastAssistantUsage(messages: OcMessage[]): {
   inputTokens: number;
   outputTokens: number;
   cost: number;
   turns: number;
 } {
-  let turns = 0;
+  const totals = { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 };
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.info.role === "user") break; // turn boundary
-    if (m.info.role !== "assistant") continue;
-    turns++;
-    const tokens = (m.info as { tokens?: { input?: number; output?: number } }).tokens;
-    const cost = (m.info as { cost?: number }).cost ?? 0;
-    return {
-      inputTokens: tokens?.input ?? 0,
-      outputTokens: tokens?.output ?? 0,
-      cost,
-      turns,
-    };
+    if (m.type === "user") break; // turn boundary
+    if (m.type !== "assistant") continue;
+    totals.turns++;
+    totals.inputTokens += m.tokens?.input ?? 0;
+    totals.outputTokens += m.tokens?.output ?? 0;
+    totals.cost += m.cost ?? 0;
   }
-  return { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 };
-}
-
-export interface OcProject {
-  id: string;
-  worktree?: string;
-  sandboxes?: string[];
-  name?: string;
+  return totals;
 }
 
 /**
@@ -693,6 +675,8 @@ export function projectLabelFor(
   if (!directory || directory === "/") return "";
   const norm = (p: string) => p.replace(/\/+$/, "");
   const dir = norm(directory);
+  // OpenChamber's internal chat dirs have no project — label them "chat"
+  if (dir.includes("/.config/openchamber/chats/")) return "chat";
   const byWorktree = new Map<string, OcProject>();
   const sandboxParent = new Map<string, string>();
   for (const p of projects) {
@@ -704,14 +688,12 @@ export function projectLabelFor(
     ? dir
     : [...sandboxParent.keys()].find((sb) => dir.startsWith(sb + "/"));
   const parent = sandboxDir !== undefined ? sandboxParent.get(sandboxDir) : undefined;
-  const worktree = parent ?? [...byWorktree.keys()].find((wt) => dir === wt || dir.startsWith(wt + "/"));
-  if (!worktree) {
-    // OpenChamber's internal chat dirs have no project — label them "chat"
-    // instead of showing the raw session UUID.
-    if (directory.includes("/.config/openchamber/chats/") && basename(directory).startsWith("session-")) {
-      return "chat";
-    }
-    return abbrevLabel(aliases?.get(dir) ?? basename(directory));
-  }
+  // longest matching worktree wins (nested projects)
+  const worktree =
+    parent ??
+    [...byWorktree.keys()]
+      .filter((wt) => dir === wt || dir.startsWith(wt + "/"))
+      .sort((a, b) => b.length - a.length)[0];
+  if (!worktree) return abbrevLabel(aliases?.get(dir) ?? basename(directory));
   return abbrevLabel(aliases?.get(worktree) ?? basename(worktree));
 }

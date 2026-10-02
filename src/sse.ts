@@ -1,10 +1,13 @@
-// Upstream SSE connection to OpenChamber with reconnect + backoff,
-// plus a pure SSE parser for tests.
+// Upstream SSE connection to the opencode v2 event stream (via OpenChamber)
+// with reconnect + backoff, plus a pure SSE parser for tests.
 
+/** One opencode v2 bus event: `{ id, type, location?, data }`. */
 export interface UpstreamEvent {
   id?: string;
   type: string;
-  properties: Record<string, unknown>;
+  data: Record<string, unknown>;
+  /** event location (`location.directory`), when the event carries one */
+  directory?: string;
 }
 
 export type UpstreamHandler = (event: UpstreamEvent) => void;
@@ -23,7 +26,7 @@ export function createSseParser(onData: (data: string) => void): {
   let buffer = "";
   return {
     push(chunk: string) {
-      buffer += chunk;
+      buffer += chunk.replace(/\r\n/g, "\n");
       let idx: number;
       while ((idx = buffer.indexOf("\n\n")) !== -1) {
         const rawEvent = buffer.slice(0, idx);
@@ -38,8 +41,12 @@ export function createSseParser(onData: (data: string) => void): {
   };
 }
 
+function rec(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
 /** Normalizes an SSE data payload into an UpstreamEvent (or null to ignore). */
-export function parseUpstreamData(payload: string): UpstreamEvent | null {
+export function parseUpstreamEvent(payload: string): UpstreamEvent | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(payload);
@@ -48,14 +55,15 @@ export function parseUpstreamData(payload: string): UpstreamEvent | null {
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const obj = parsed as Record<string, unknown>;
-  // /api/global/event wraps the bus event in { payload: {...} }
-  const inner = typeof obj.payload === "object" && obj.payload !== null ? obj.payload : obj;
-  const ev = inner as Record<string, unknown>;
+  // tolerate a `{ payload: {...} }` envelope (OpenChamber global stream variants)
+  const ev = typeof obj.payload === "object" && obj.payload !== null ? rec(obj.payload) : obj;
   if (typeof ev.type !== "string") return null;
+  const directory = rec(ev.location).directory;
   return {
     id: typeof ev.id === "string" ? ev.id : undefined,
     type: ev.type,
-    properties: (ev.properties ?? {}) as Record<string, unknown>,
+    data: rec(ev.data ?? ev.properties),
+    directory: typeof directory === "string" ? directory : undefined,
   };
 }
 
@@ -65,10 +73,11 @@ interface SseController {
 
 interface SseDeps {
   url: string;
+  headers?: Record<string, string>;
   fetchImpl?: typeof fetch;
   onEvent: UpstreamHandler;
   onConnected?: () => void;
-  onDisconnected?: () => void;
+  onDisconnected?: (reason?: string) => void;
   signal?: AbortSignal;
   rand?: () => number;
   /** injectable sleep for tests (defaults to real timers) */
@@ -92,14 +101,19 @@ export function connectUpstream(deps: SseDeps): SseController {
       try {
         const res = await fetchImpl(deps.url, {
           signal,
-          headers: { Accept: "text/event-stream" },
+          headers: { Accept: "text/event-stream", ...deps.headers },
         });
         if (!res.ok || !res.body) throw new Error(`upstream HTTP ${res.status}`);
         attempt = 0;
         deps.onConnected?.();
         const parser = createSseParser((data) => {
           const event = parseUpstreamEvent(data);
-          if (event) deps.onEvent(event);
+          if (!event) return;
+          try {
+            deps.onEvent(event);
+          } catch {
+            // one bad event must never kill the stream
+          }
         });
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -108,9 +122,9 @@ export function connectUpstream(deps: SseDeps): SseController {
           if (done) break;
           parser.push(decoder.decode(value, { stream: true }));
         }
-        deps.onDisconnected?.();
-      } catch {
-        deps.onDisconnected?.();
+        deps.onDisconnected?.("stream ended");
+      } catch (err) {
+        if (!signal.aborted) deps.onDisconnected?.((err as Error).message);
       }
       if (signal.aborted) return;
       await sleep(backoffDelay(attempt++, rand));
@@ -118,23 +132,4 @@ export function connectUpstream(deps: SseDeps): SseController {
   })();
 
   return { abort: () => ac.abort() };
-}
-
-export function parseUpstreamEvent(payload: string): UpstreamEvent | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(payload);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const obj = parsed as Record<string, unknown>;
-  const inner = typeof obj.payload === "object" && obj.payload !== null ? obj.payload : obj;
-  const ev = inner as Record<string, unknown>;
-  if (typeof ev.type !== "string") return null;
-  return {
-    id: typeof ev.id === "string" ? ev.id : undefined,
-    type: ev.type,
-    properties: (ev.properties ?? {}) as Record<string, unknown>,
-  };
 }

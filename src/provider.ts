@@ -1,123 +1,83 @@
-// OpenCode provider for the even-terminal wire contract, backed by OpenChamber.
+// OpenCode provider for the even-terminal wire contract, backed by the
+// opencode v2 API (served by OpenChamber or an opencode server).
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 
-import type {
-  EvenMessage,
-  EvenProvider,
-  EvenSession,
-  HistoryItem,
-  ProviderInfo,
-} from "./types.ts";
+import type { EvenMessage, EvenProvider } from "./types.ts";
 import { MessageHub } from "./hub.ts";
-import { OpenChamberClient, type OcMessage, type OcSession } from "./openchamber.ts";
+import { OpenChamberClient, type OcProject, type OcSession } from "./openchamber.ts";
 import { connectUpstream, type UpstreamEvent } from "./sse.ts";
 import { DeltaCoalescer } from "./throttle.ts";
 import {
   OpencodeEventTranslator,
   decisionToResponse,
+  formAnswerFromLabels,
+  formAskQuestions,
+  formQuestionMessage,
   lastAssistantText,
   lastAssistantUsage,
   parseQuestionAnswer,
   permissionRequestMessage,
   projectLabelFor,
-  questionMessage,
   sessionState,
   toEvenSession,
   toHistoryRows,
   visibleRootSessions,
-  type OcProject,
+  type AskQuestion,
 } from "./translate.ts";
 
 // The Even app filters its session list to known providers, so we present
 // as "claude" on the wire (same trick even-terminal-pi uses).
 export const PROVIDER_NAME = "claude";
 
-const MERGE_TTL_MS = 5_000;
+const CACHE_TTL_MS = 5_000;
 const SYNC_INTERVAL_MS = 30_000;
 const RUNNING_STATS_INTERVAL_MS = 10_000;
+const SESSION_FETCH_LIMIT = 100;
+/** directories polled for pending permissions/forms on each snapshot */
+const ASK_DIRS_MAX = 12;
 
 export interface OpencodeProviderOptions {
   oc: OpenChamberClient;
   hub: MessageHub;
-  /** Upstream OpenChamber global event URL (GET /api/global/event). */
+  /** Upstream v2 event stream URL (GET /api/event). */
   eventUrl: string;
   hostLabel?: string;
-  mergeTtlMs?: number;
+  cacheTtlMs?: number;
   /** prefix session titles with their project label (default true) */
   prefixTitles?: boolean;
   /** OpenChamber settings.json path for project aliases (default ~/.config/openchamber/settings.json) */
   settingsPath?: string;
-  /** pinned directory for new glasses sessions (default: projectless chat) */
+  /** pinned directory for new glasses sessions (default: server default location) */
   newSessionDir?: string;
-  /** session registry path (default ~/.config/openchamber/terminal-bridge-sessions.json) */
-  registryPath?: string;
   /** emit tool cards for read-only tools too (default: quiet summaries only) */
   verboseTools?: boolean;
+  /** diagnostics sink (never receives tokens) */
+  log?: (line: string) => void;
 }
 
 interface PendingAsk {
   requestId: string;
   sessionId: string;
-  directory?: string;
   toolName: string;
   description: string;
-  questions: Array<{ question?: string; header?: string }>;
-  /** "event" = live stream (cleared by replied events); "snapshot" = REST */
-  source: "event" | "snapshot";
+  questions: AskQuestion[];
+  at: number;
 }
+
+type AskKind = "permission" | "question";
 
 export function createOpencodeProvider(
   opts: OpencodeProviderOptions,
 ): EvenProvider & { start: () => void; stop: () => void; syncNow: () => Promise<void> } {
   const { oc, hub, eventUrl } = opts;
-  const mergeTtlMs = opts.mergeTtlMs ?? MERGE_TTL_MS;
+  const cacheTtlMs = opts.cacheTtlMs ?? CACHE_TTL_MS;
+  const log = opts.log ?? (() => undefined);
 
   // ── tracked state (all bounded) ───────────────────────
   const knownSessions = new Map<string, OcSession>();
-  const activity: Record<string, { type: string }> = {};
-  /** persisted registry path — projectless sessions must survive restarts */
-  const registryPath = opts.registryPath ?? `${homedir()}/.config/openchamber/terminal-bridge-sessions.json`;
-  let registryTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** Load the persisted session registry (survives bridge restarts). */
-  async function loadRegistry(): Promise<void> {
-    try {
-      const raw = JSON.parse(await readFile(registryPath, "utf8")) as OcSession[];
-      for (const s of Array.isArray(raw) ? raw : []) {
-        if (s?.id && !knownSessions.has(s.id)) knownSessions.set(s.id, s);
-      }
-    } catch {
-      // first run or unreadable — empty registry
-    }
-  }
-
-  /** Persist the registry (debounced) so restarts never orphan sessions. */
-  function schedulePersist(): void {
-    if (registryTimer) return;
-    registryTimer = setTimeout(() => {
-      registryTimer = null;
-      void persistRegistry();
-    }, 500);
-  }
-
-  async function persistRegistry(): Promise<void> {
-    try {
-      const dir = registryPath.slice(0, registryPath.lastIndexOf("/"));
-      await mkdir(dir, { recursive: true });
-      const cutoff = Date.now() - 30 * 24 * 3600_000;
-      const entries = [...knownSessions.values()]
-        .filter((s) => !s.time?.archived && (s.time?.updated ?? 0) > cutoff)
-        .slice(0, 2000);
-      await writeFile(registryPath, JSON.stringify(entries));
-    } catch {
-      // best effort
-    }
-  }
-
-
-  // pending asks keyed by requestId — a session can have several at once
+  let activity: Record<string, { type: string }> = {};
   const pendingPermission = new Map<string, PendingAsk>();
   const pendingQuestion = new Map<string, PendingAsk>();
   /** `${kind}:${sessionId}` -> FIFO requestIds */
@@ -125,13 +85,22 @@ export function createOpencodeProvider(
   const busySessions = new Set<string>();
   /** sessionId -> turn start (for running_stats duration) */
   const busySince = new Map<string, number>();
-  /** sessionId -> last known usage from message.updated events (for running_stats) */
-  const usageCache = new Map<string, { input: number; output: number; cost: number }>();
+  /** sessionId -> latest usage from session.usage.updated (for running_stats) */
+  const usageCache = new Map<string, { input: number; output: number }>();
+  /** sessions whose idle transition already produced a `result` this turn */
+  const idleHandled = new Set<string>();
+  /** sessionId -> error message of a turn that failed (result reports success: false) */
+  const failedTurns = new Map<string, string>();
+  let defaultDir: string | undefined;
 
-  const translator = new OpencodeEventTranslator("", opts.verboseTools ?? false);
+  const translator = new OpencodeEventTranslator(opts.verboseTools ?? false);
   let upstream: { abort: () => void } | null = null;
   let syncTimer: ReturnType<typeof setInterval> | null = null;
   let statsTimer: ReturnType<typeof setInterval> | null = null;
+
+  const coalescer = new DeltaCoalescer((sessionId, text) => {
+    hub.emit(sessionId, { type: "text_delta", text });
+  });
 
   function emit(sessionId: string, msg: EvenMessage): void {
     // keep delta ordering: flush buffered text before any other message
@@ -139,23 +108,43 @@ export function createOpencodeProvider(
     hub.emit(sessionId, msg);
   }
 
-  const coalescer = new DeltaCoalescer((sessionId, text) => {
-    hub.emit(sessionId, { type: "text_delta", text });
-  });
+  function emitDelta(sessionId: string, text: string): void {
+    coalescer.push(sessionId, text);
+  }
 
-  function trackStatus(sessionId: string, state: string): void {
-    if (state === "busy") {
-      busySessions.add(sessionId);
-      if (!busySince.has(sessionId)) busySince.set(sessionId, Date.now());
-      startStatsTimer();
-    }
-    if (state === "idle") {
-      busySessions.delete(sessionId);
-      busySince.delete(sessionId);
+  function rec(value: unknown): Record<string, unknown> {
+    return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  }
+
+  function str(value: unknown): string {
+    return typeof value === "string" ? value : "";
+  }
+
+  function rememberSession(s: OcSession): void {
+    knownSessions.delete(s.id); // re-insert keeps the map in recency order
+    knownSessions.set(s.id, s);
+    while (knownSessions.size > 1000) {
+      const first = knownSessions.keys().next().value;
+      if (first === undefined) break;
+      knownSessions.delete(first);
     }
   }
 
-  /** Live token/duration tick per busy session, mirroring upstream's cadence. */
+  // ── busy/idle + running stats ──────────────────────────
+
+  function markBusy(sessionId: string): void {
+    idleHandled.delete(sessionId);
+    busySessions.add(sessionId);
+    activity[sessionId] = { type: "running" };
+    if (!busySince.has(sessionId)) busySince.set(sessionId, Date.now());
+    startStatsTimer();
+  }
+
+  function markIdle(sessionId: string): void {
+    busySessions.delete(sessionId);
+    delete activity[sessionId];
+  }
+
   function emitRunningStats(): void {
     if (busySessions.size === 0) {
       if (statsTimer) {
@@ -181,111 +170,113 @@ export function createOpencodeProvider(
     statsTimer = setInterval(emitRunningStats, RUNNING_STATS_INTERVAL_MS);
   }
 
-  function rec(value: unknown): Record<string, unknown> {
-    return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-  }
+  // ── upstream events ────────────────────────────────────
 
-  function str(value: unknown): string {
-    return typeof value === "string" ? value : "";
-  }
-
-  /** Cache usage from message.updated events for running_stats. */
-  function trackUsage(event: UpstreamEvent): void {
-    const props = event.properties ?? {};
-    const info = rec(props.info);
-    const sessionId = str(info.sessionID);
-    if (!sessionId) return;
-    if (str(info.role) !== "assistant") return;
-    const tokens = rec(info.tokens);
-    usageCache.set(sessionId, {
-      input: typeof tokens.input === "number" ? tokens.input : 0,
-      output: typeof tokens.output === "number" ? tokens.output : 0,
-      cost: typeof info.cost === "number" ? info.cost : 0,
-    });
-    if (usageCache.size > 128) {
-      const first = usageCache.keys().next().value;
-      if (first !== undefined) usageCache.delete(first);
+  /** Session bookkeeping events that don't render on the glasses. */
+  function trackSessionEvent(event: UpstreamEvent): void {
+    const d = event.data;
+    const sessionId = str(d.sessionID);
+    switch (event.type) {
+      case "session.usage.updated": {
+        const tokens = rec(d.tokens);
+        usageCache.set(sessionId, {
+          input: typeof tokens.input === "number" ? tokens.input : 0,
+          output: typeof tokens.output === "number" ? tokens.output : 0,
+        });
+        if (usageCache.size > 128) {
+          const first = usageCache.keys().next().value;
+          if (first !== undefined) usageCache.delete(first);
+        }
+        break;
+      }
+      case "session.created":
+        if (sessionId && !str(d.parentID)) {
+          oc.getSession(sessionId)
+            .then((s) => {
+              rememberSession(s);
+              sessionsCache = null;
+            })
+            .catch(() => undefined);
+        }
+        break;
+      case "session.renamed": {
+        const known = knownSessions.get(sessionId);
+        if (known) known.title = str(d.title) || known.title;
+        sessionsCache = null;
+        break;
+      }
+      case "session.deleted":
+        knownSessions.delete(sessionId);
+        sessionsCache = null;
+        break;
+      case "session.step.started": {
+        const known = knownSessions.get(sessionId);
+        const model = rec(d.model);
+        if (known && typeof model.id === "string") {
+          known.model = { id: model.id, providerID: str(model.providerID), variant: str(model.variant) || undefined };
+        }
+        break;
+      }
     }
   }
 
   function handleUpstreamEvent(event: UpstreamEvent): void {
-    if (event.type === "message.updated") trackUsage(event);
+    trackSessionEvent(event);
     for (const translated of translator.translate(event)) {
       const { sessionId, msg } = translated;
       if (translated.reply) {
         // answered elsewhere (OpenChamber UI / auto-accept): clear + hint only
         // if the ask was visible on the glasses
         const pending = pendingByKind(translated.reply.kind).get(translated.reply.requestId);
-        clearPending(translated.reply.kind, sessionId, translated.reply.requestId);
-        if (pending) emit(sessionId, translated.msg);
+        clearPending(translated.reply.kind, pending?.sessionId ?? sessionId, translated.reply.requestId);
+        if (pending) emit(pending.sessionId, msg);
         continue;
       }
       if (translated.ask) {
-        trackAsk(translated);
-        if (translated.msg.type === "user_question") {
-          const q = translated.msg as { questions: Array<{ question: string }> };
+        if (pendingByKind(translated.ask.kind).has(translated.ask.requestId)) continue; // already shown
+        trackAsk(translated.ask.kind, sessionId, translated.ask.requestId, msg, translated.ask.questions);
+        if (msg.type === "user_question") {
           emit(sessionId, {
             type: "notification",
             title: "Agent asks",
-            message: q.questions[0]?.question?.slice(0, 120) || "Agent has a question",
+            message: msg.questions[0]?.question?.slice(0, 120) || "Agent has a question",
           });
         }
       }
-      if (msg.type === "status") {
-        trackStatus(sessionId, msg.state);
-        if (msg.state === "idle") {
-          busySessions.delete(sessionId);
-          coalescer.flush(sessionId); // deltas land before the result
-          for (const closed of translator.closeBlock(sessionId)) {
-            emit(closed.sessionId, closed.msg);
-          }
-          void emitIdleResult(sessionId); // result message doubles as idle signal
-          continue;
-        }
+      if (msg.type === "status" && msg.state === "busy") {
+        const alreadyBusy = busySessions.has(sessionId);
+        markBusy(sessionId);
+        if (alreadyBusy) continue; // the prompt already announced this turn
+      } else if (msg.type === "status" && msg.state === "idle") {
+        markIdle(sessionId);
+        if (idleHandled.has(sessionId)) continue;
+        idleHandled.add(sessionId);
+        coalescer.flush(sessionId); // deltas land before the result
+        for (const closed of translator.closeBlock(sessionId)) emit(closed.sessionId, closed.msg);
+        const failure = failedTurns.get(sessionId);
+        failedTurns.delete(sessionId);
+        void emitIdleResult(sessionId, failure); // result message doubles as idle signal
+        continue;
+      }
+      if (msg.type === "error") failedTurns.set(sessionId, msg.message);
+      if (msg.type === "text_delta") {
+        emitDelta(sessionId, msg.text);
+        continue;
       }
       emit(sessionId, msg);
     }
-    if (event.type === "permission.asked" || event.type === "question.asked") {
-      scheduleAskResync(); // catch auto-accept filtered siblings via REST
+    if (event.type === "permission.asked" || event.type === "form.created") {
+      scheduleAskResync(); // catch siblings filtered out of the stream
     }
   }
 
-  /** Store the request id so ring replies know where to POST. */
-  function trackAsk(t: {
-    sessionId: string;
-    msg: EvenMessage;
-    ask?: { kind: "permission" | "question"; requestId: string; questions: Array<{ question?: string; header?: string }> };
-  }): void {
-    if (!t.ask) return;
-    const map = pendingByKind(t.ask.kind);
-    if (!map.has(t.ask.requestId)) pushAskQueue(t.ask.kind, t.sessionId, t.ask.requestId);
-    map.set(t.ask.requestId, {
-      requestId: t.ask.requestId,
-      sessionId: t.sessionId,
-      directory: knownSessions.get(t.sessionId)?.directory,
-      toolName: t.msg.type === "permission_request" ? (t.msg as { toolName: string }).toolName : "question",
-      description:
-        t.msg.type === "permission_request"
-          ? (t.msg as { description: string }).description
-          : "Agent has a question",
-      questions: t.ask.questions,
-      source: "event",
-    });
-  }
+  // ── pending asks (permissions + forms) ─────────────────
 
-  /** Remove one pending ask (by requestId) from the kind map + session queue. */
-  function clearPending(kind: "permission" | "question", sessionId: string, requestId: string): void {
-    pendingByKind(kind).delete(requestId);
-    const queue = queueOf(kind, sessionId);
-    const idx = queue.indexOf(requestId);
-    if (idx !== -1) queue.splice(idx, 1);
-  }
-
-  function pendingByKind(kind: "permission" | "question"): Map<string, PendingAsk> {
+  function pendingByKind(kind: AskKind): Map<string, PendingAsk> {
     return kind === "permission" ? pendingPermission : pendingQuestion;
   }
 
-  function queueOf(kind: "permission" | "question", sessionId: string): string[] {
+  function queueOf(kind: AskKind, sessionId: string): string[] {
     const key = `${kind}:${sessionId}`;
     let q = askQueues.get(key);
     if (!q) {
@@ -295,12 +286,29 @@ export function createOpencodeProvider(
     return q;
   }
 
-  function pushAskQueue(kind: "permission" | "question", sessionId: string, requestId: string): void {
+  /** Store the request id so ring replies know where to POST. */
+  function trackAsk(kind: AskKind, sessionId: string, requestId: string, msg: EvenMessage, questions: AskQuestion[]): void {
     queueOf(kind, sessionId).push(requestId);
+    pendingByKind(kind).set(requestId, {
+      requestId,
+      sessionId,
+      toolName: msg.type === "permission_request" ? msg.toolName : "question",
+      description: msg.type === "permission_request" ? msg.description : "Agent has a question",
+      questions,
+      at: Date.now(),
+    });
+  }
+
+  function clearPending(kind: AskKind, sessionId: string, requestId: string): void {
+    pendingByKind(kind).delete(requestId);
+    const queue = queueOf(kind, sessionId);
+    const idx = queue.indexOf(requestId);
+    if (idx !== -1) queue.splice(idx, 1);
+    if (queue.length === 0) askQueues.delete(`${kind}:${sessionId}`);
   }
 
   /** Oldest still-tracked pending ask for the session (FIFO ring semantics). */
-  function shiftAsk(kind: "permission" | "question", sessionId: string): PendingAsk | undefined {
+  function shiftAsk(kind: AskKind, sessionId: string): PendingAsk | undefined {
     const queue = queueOf(kind, sessionId);
     while (queue.length > 0) {
       const requestId = queue.shift()!;
@@ -311,122 +319,123 @@ export function createOpencodeProvider(
   }
 
   function hasPendingAsk(sessionId: string): boolean {
-    for (const entry of pendingPermission.values()) {
-      if (entry.sessionId === sessionId) return true;
-    }
-    for (const entry of pendingQuestion.values()) {
-      if (entry.sessionId === sessionId) return true;
-    }
+    for (const entry of pendingPermission.values()) if (entry.sessionId === sessionId) return true;
+    for (const entry of pendingQuestion.values()) if (entry.sessionId === sessionId) return true;
     return false;
   }
 
-  /** Fire-and-forget pending-ask resync, debounced. */
   let askResyncTimer: ReturnType<typeof setTimeout> | null = null;
   function scheduleAskResync(): void {
     if (askResyncTimer) return;
     askResyncTimer = setTimeout(() => {
       askResyncTimer = null;
       void syncPendingAsks();
-    }, 100);
+    }, 250);
+  }
+
+  /** Locations worth polling: running sessions first, then the most recent ones. */
+  function askDirectories(): Array<string | undefined> {
+    const dirs = new Set<string>();
+    for (const id of Object.keys(activity)) {
+      const dir = knownSessions.get(id)?.directory;
+      if (dir) dirs.add(dir);
+    }
+    const recent = [...knownSessions.values()].sort((a, b) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0));
+    for (const s of recent) {
+      if (dirs.size >= ASK_DIRS_MAX) break;
+      if (s.directory) dirs.add(s.directory);
+    }
+    return [undefined, ...dirs];
+  }
+
+  /** REST snapshot of pending permissions/forms (fallback for missed events). */
+  async function syncPendingAsks(): Promise<void> {
+    const dirs = askDirectories();
+    const results = await Promise.allSettled(
+      dirs.map(async (dir) => ({ permissions: await oc.pendingPermissions(dir), forms: await oc.pendingForms(dir) })),
+    );
+    let complete = true;
+    const seen = { permission: new Set<string>(), question: new Set<string>() };
+    for (const result of results) {
+      if (result.status === "rejected") {
+        complete = false;
+        continue;
+      }
+      for (const p of result.value.permissions) {
+        if (!p.id || !p.sessionID || seen.permission.has(p.id)) continue;
+        seen.permission.add(p.id);
+        if (pendingPermission.has(p.id)) continue;
+        const msg = permissionRequestMessage(p);
+        trackAsk("permission", p.sessionID, p.id, msg, []);
+        emit(p.sessionID, msg);
+      }
+      for (const f of result.value.forms) {
+        if (!f.id || !f.sessionID || seen.question.has(f.id)) continue;
+        seen.question.add(f.id);
+        if (pendingQuestion.has(f.id)) continue;
+        const msg = formQuestionMessage(f);
+        if (!msg) continue;
+        trackAsk("question", f.sessionID, f.id, msg, formAskQuestions(f));
+        emit(f.sessionID, msg);
+      }
+    }
+    if (!complete) return;
+    // drop asks that disappeared upstream (answered elsewhere, missed event)
+    const cutoff = Date.now() - 5_000;
+    for (const kind of ["permission", "question"] as const) {
+      for (const [requestId, entry] of pendingByKind(kind)) {
+        if (entry.at < cutoff && !seen[kind].has(requestId)) clearPending(kind, entry.sessionId, requestId);
+      }
+    }
+  }
+
+  // ── snapshots ──────────────────────────────────────────
+
+  let sessionsCache: { at: number; rows: OcSession[] } | null = null;
+
+  async function fetchSessions(force = false): Promise<OcSession[]> {
+    const now = Date.now();
+    if (!force && sessionsCache && now - sessionsCache.at < cacheTtlMs) return sessionsCache.rows;
+    const rows = await oc.listSessions(SESSION_FETCH_LIMIT);
+    for (const s of rows) rememberSession(s);
+    sessionsCache = { at: now, rows };
+    return rows;
   }
 
   async function syncSnapshot(): Promise<void> {
     try {
-      // ingest ALL servers (default + project/worktree directories) — a
-      // session that only exists in a project dir would otherwise be unknown
-      // to getStatus, and ring answers would 404. Archived sessions stay
-      // archived (the registry never resurrects them).
-      for (const s of await mergedSessionRows()) {
-        const known = knownSessions.get(s.id);
-        if (known?.time?.archived && !s.time?.archived) continue;
-        knownSessions.set(s.id, s);
+      await fetchSessions(true);
+    } catch (err) {
+      log(`[sync] session list failed: ${(err as Error).message}`);
+    }
+    try {
+      activity = await oc.activeSessions();
+      for (const id of Object.keys(activity)) {
+        if (!busySessions.has(id)) markBusy(id);
       }
-      Object.assign(activity, await oc.sessionActivity());
-    } catch {
-      // keep last known state
+      for (const id of [...busySessions]) {
+        if (!activity[id]) markIdle(id);
+      }
+    } catch (err) {
+      log(`[sync] activity failed: ${(err as Error).message}`);
     }
-    schedulePersist();
-    await syncPendingAsks();
-  }
-
-  /** REST fallback sync of pending permissions/questions (per requestId). */
-  async function syncPendingAsks(): Promise<void> {
-    let permissions: Array<Record<string, unknown>> = [];
-    let questions: Array<Record<string, unknown>> = [];
-    try {
-      permissions = (await oc.pendingPermissions()) as unknown as Array<Record<string, unknown>>;
-    } catch {
-      // keep going — questions may still be available
-    }
-    try {
-      questions = (await oc.pendingQuestions()) as unknown as Array<Record<string, unknown>>;
-    } catch {
-      // keep going — permissions may have been fetched
-    }
-    const seenPermissions = new Set<string>();
-    for (const p of permissions) {
-      const sessionId = str(p.sessionID) || str(p.sessionId);
-      const requestId = str(p.id);
-      if (!sessionId || !requestId) continue;
-      seenPermissions.add(requestId);
-      if (pendingPermission.has(requestId)) continue;
-      pushAskQueue("permission", sessionId, requestId);
-      pendingPermission.set(requestId, {
-        requestId,
-        sessionId,
-        directory: knownSessions.get(sessionId)?.directory,
-        toolName: str(p.type) || "permission",
-        description: str(p.title) || "Permission required",
-        questions: [],
-        source: "snapshot",
-      });
-      emit(sessionId, permissionRequestMessage(p as unknown as Parameters<typeof permissionRequestMessage>[0]));
-    }
-    for (const [requestId, entry] of pendingPermission) {
-      if (entry.source === "snapshot" && !seenPermissions.has(requestId)) pendingPermission.delete(requestId);
-    }
-
-    const seenQuestions = new Set<string>();
-    for (const q of questions) {
-      const sessionId = str(q.sessionID) || str(q.sessionId);
-      const requestId = str(q.id) || str(q.requestID);
-      if (!sessionId || !requestId) continue;
-      seenQuestions.add(requestId);
-      if (pendingQuestion.has(requestId)) continue;
-      const msg = questionMessage(q as unknown as Parameters<typeof questionMessage>[0]);
-      if (!msg) continue;
-      const qs = Array.isArray((q as { questions?: Array<{ question?: string; header?: string }> }).questions)
-        ? ((q as { questions: Array<{ question?: string; header?: string }> }).questions ?? [])
-        : [];
-      pushAskQueue("question", sessionId, requestId);
-      pendingQuestion.set(requestId, {
-        requestId,
-        sessionId,
-        directory: knownSessions.get(sessionId)?.directory,
-        toolName: "question",
-        description: "Agent has a question",
-        questions: qs,
-        source: "snapshot",
-      });
-      emit(sessionId, msg);
-    }
-    for (const [requestId, entry] of pendingQuestion) {
-      if (entry.source === "snapshot" && !seenQuestions.has(requestId)) pendingQuestion.delete(requestId);
-    }
+    if (defaultDir === undefined) defaultDir = await oc.defaultDirectory().catch(() => undefined);
+    translator.prune();
+    await syncPendingAsks().catch((err: Error) => log(`[sync] pending asks failed: ${err.message}`));
   }
 
   /** On idle: surface the final assistant answer as a `result` message. */
-  async function emitIdleResult(sessionId: string): Promise<void> {
+  async function emitIdleResult(sessionId: string, failure?: string): Promise<void> {
+    const startedAt = busySince.get(sessionId);
+    busySince.delete(sessionId);
     try {
-      const session = knownSessions.get(sessionId);
-      const messages = await oc.messages(sessionId, session?.directory);
+      const messages = await oc.messages(sessionId, 60);
       const text = lastAssistantText(messages);
       const usage = lastAssistantUsage(messages);
-      const startedAt = busySince.get(sessionId);
       emit(sessionId, {
         type: "result",
-        success: true,
-        text: text || "Turn complete.",
+        success: failure === undefined,
+        text: text || failure || "Turn complete.",
         sessionId,
         costUsd: usage.cost,
         provider: PROVIDER_NAME,
@@ -435,32 +444,35 @@ export function createOpencodeProvider(
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
       });
-    } catch {
+    } catch (err) {
+      log(`[result] ${sessionId}: ${(err as Error).message}`);
       emit(sessionId, { type: "status", state: "idle", sessionId });
     }
   }
 
-  // ── merged session listing (default server + per-directory) ──
-  let projectsCache: { at: number; projects: OcProject[] } | null = null;
-  const withPrefix = opts.prefixTitles ?? true;
-  let aliasesCache: { at: number; map: Map<string, string> } | null = null;
-  const settingsPath = opts.settingsPath ?? `${homedir()}/.config/openchamber/settings.json`;
+  // ── labels ─────────────────────────────────────────────
 
-  async function fetchProjectsCached(): Promise<OcProject[]> {
+  const withPrefix = opts.prefixTitles ?? true;
+  const settingsPath = opts.settingsPath ?? `${homedir()}/.config/openchamber/settings.json`;
+  let projectsCache: { at: number; projects: OcProject[] } | null = null;
+  let aliasesCache: { at: number; map: Map<string, string> } | null = null;
+
+  async function fetchProjects(): Promise<OcProject[]> {
     const now = Date.now();
-    if (projectsCache && now - projectsCache.at < mergeTtlMs) return projectsCache.projects;
+    if (projectsCache && now - projectsCache.at < cacheTtlMs) return projectsCache.projects;
     try {
-      projectsCache = { at: now, projects: await oc.listProjects() };
-      return projectsCache.projects;
+      const projects = (await oc.listProjects()).filter((p) => p.worktree && p.worktree !== defaultDir);
+      projectsCache = { at: now, projects };
+      return projects;
     } catch {
       return projectsCache?.projects ?? [];
     }
   }
 
-  /** directory -> project alias, from OpenChamber settings.json projects[].label */
+  /** directory -> project alias, from OpenChamber settings.json projects[].label (local only). */
   async function fetchAliases(): Promise<Map<string, string>> {
     const now = Date.now();
-    if (aliasesCache && now - aliasesCache.at < mergeTtlMs) return aliasesCache.map;
+    if (aliasesCache && now - aliasesCache.at < cacheTtlMs) return aliasesCache.map;
     const map = new Map<string, string>();
     try {
       const raw = JSON.parse(await readFile(settingsPath, "utf8")) as {
@@ -468,94 +480,51 @@ export function createOpencodeProvider(
       };
       for (const p of raw.projects ?? []) {
         if (typeof p.path === "string" && typeof p.label === "string" && p.label.trim()) {
-          map.set(normalizeDir(p.path), p.label.trim());
+          map.set(p.path.replace(/\/+$/, ""), p.label.trim());
         }
       }
     } catch {
-      // settings file missing/unreadable — fall back to folder names
+      // settings file missing (e.g. remote OpenChamber) — fall back to folder names
     }
-    aliasesCache = { at: Date.now(), map };
+    aliasesCache = { at: now, map };
     return map;
   }
 
-  function normalizeDir(p: string): string {
-    return p.replace(/\/+$/, "");
+  function labelFor(s: OcSession, projects: OcProject[], aliases: Map<string, string>): string {
+    if (!s.directory || s.directory === defaultDir) return "chat";
+    return projectLabelFor(s.directory, projects, aliases);
   }
 
-  async function listDirectories(): Promise<string[]> {
-    const dirs = new Set<string>();
-    for (const p of await fetchProjectsCached()) {
-      if (p.worktree) dirs.add(p.worktree);
-      for (const sb of p.sandboxes ?? []) dirs.add(sb);
-    }
-    // settings.json projects[] is the authoritative list — /api/project may
-    // only expose a subset (the desktop's currently-registered servers)
-    for (const dir of (await fetchAliases()).keys()) dirs.add(dir);
-    return [...dirs];
-  }
-
-  async function mergedSessionRows(): Promise<OcSession[]> {
-    const rows = new Map<string, OcSession>();
-    const ingest = (list: OcSession[]) => {
-      for (const s of list) if (!rows.has(s.id)) rows.set(s.id, s);
-    };
-    const jobs: Array<Promise<void>> = [oc.listSessions().then(ingest).catch(() => undefined)];
-    for (const dir of await listDirectories()) {
-      jobs.push(oc.listSessions(dir).then(ingest).catch(() => undefined));
-    }
-    await Promise.all(jobs);
-    return [...rows.values()];
-  }
+  // ── provider surface ───────────────────────────────────
 
   const provider: EvenProvider & { start: () => void; stop: () => void } = {
     async listSessions(limit, cwd) {
-      const all = await mergedSessionRows();
+      const all = await fetchSessions();
       const visible = visibleRootSessions(all);
-      const filtered = cwd ? visible.filter((s) => (s.directory ?? "").startsWith(cwd)) : visible;
-      const projects = await fetchProjectsCached();
-      const aliases = await fetchAliases();
-      const rows = filtered
+      const root = cwd?.replace(/\/+$/, "");
+      const filtered = root
+        ? visible.filter((s) => s.directory === root || (s.directory ?? "").startsWith(`${root}/`))
+        : visible;
+      const [projects, aliases] = withPrefix ? await Promise.all([fetchProjects(), fetchAliases()]) : [[], new Map()];
+      return filtered
         .slice(0, limit)
-        .map((s) => {
-          if (!withPrefix) return toEvenSession(s);
-          // sessions living in OpenChamber's default (home) directory are
-          // projectless chats, not the home-folder "project"
-          const label =
-            s.directory === homedir() ? "chat" : projectLabelFor(s.directory, projects, aliases);
-          return toEvenSession(s, label);
-        });
-      // projectless glasses sessions live in knownSessions (invisible in the
-      // per-directory listings) — overlay them so the glasses can still see them
-      for (const s of knownSessions.values()) {
-        if (s.time?.archived || rows.some((r) => r.id === s.id)) continue;
-        const ocListed = all.some((x) => x.id === s.id);
-        if (ocListed) continue;
-        const label = withPrefix
-          ? s.directory && s.directory !== homedir()
-            ? projectLabelFor(s.directory, projects, aliases)
-            : "chat"
-          : undefined;
-        rows.push(toEvenSession(s, label));
-      }
-      rows.sort((a, b) => (b.timestamp ?? "").localeCompare(a.timestamp ?? ""));
-      return rows.slice(0, limit);
+        .map((s) => (withPrefix ? toEvenSession(s, labelFor(s, projects, aliases)) : toEvenSession(s)));
     },
 
     async getSessionStatus(id) {
-      if (hasPendingAsk(id)) return "awaiting";
-      return activity[id]?.type === "busy" ? "busy" : "idle";
+      return sessionState(activity, id, hasPendingAsk(id));
     },
 
     async getInfo() {
       let model = "OpenCode";
       try {
-        const recent = visibleRootSessions(await oc.listSessions())[0];
+        const recent = visibleRootSessions(await fetchSessions())[0];
         if (recent?.model) model = recent.model.id;
       } catch {
         // keep default
       }
       return {
-        account: { email: "", organization: opts.hostLabel ?? "OpenChamber", subscriptionType: "" },
+        account: { email: "", organization: opts.hostLabel || "OpenChamber", subscriptionType: "" },
         model,
         version: "opencode",
         provider: PROVIDER_NAME,
@@ -563,35 +532,23 @@ export function createOpencodeProvider(
     },
 
     async getHistory(id, limit) {
-      const session = knownSessions.get(id);
-      const messages: OcMessage[] = await oc.messages(id, session?.directory);
-      return toHistoryRows(messages, limit);
+      return toHistoryRows(await oc.messages(id, 100), limit);
     },
 
     async prompt(sessionId, text, cwd) {
-      // New session from the Even app (no sessionId): create a projectless
-      // chat via OpenChamber, then prompt into it. Replies go directly to the
-      // opencode server (requestId-scoped), so no directory is required.
+      // New session from the Even app (no sessionId): create one at the
+      // pinned/requested directory, or the server's default location.
       if (!sessionId) {
         const title = text.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
         const created = await oc.createSession(title, cwd || opts.newSessionDir || undefined);
+        if (!created.id) throw new Error("OpenCode did not return a session id");
         sessionId = created.id;
-        knownSessions.set(created.id, created);
-        schedulePersist();
+        rememberSession(created);
+        sessionsCache = null;
       }
-      const session = knownSessions.get(sessionId);
-      const directory = session?.directory ?? cwd;
       emit(sessionId, { type: "user_prompt", text });
-      await oc.promptAsync(
-        sessionId,
-        text,
-        directory,
-        session?.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined,
-        session?.agent,
-      );
-      busySessions.add(sessionId);
-      if (!busySince.has(sessionId)) busySince.set(sessionId, Date.now());
-      startStatsTimer();
+      await oc.prompt(sessionId, text);
+      markBusy(sessionId);
       emit(sessionId, { type: "status", state: "busy", sessionId });
       return { sessionId, provider: PROVIDER_NAME };
     },
@@ -605,71 +562,66 @@ export function createOpencodeProvider(
         type: "permission_result",
         toolName: pending.toolName,
         summary: pending.description,
-        decision:
-          decision === "allow" ? "allowed" : decision === "allowAlways" ? "always" : "denied",
+        decision: decision === "allow" ? "allowed" : decision === "allowAlways" ? "always" : "denied",
       });
-      // OpenChamber's local API has no reply route — reply directly on the
-      // opencode server; fall back to the OC proxy (older versions).
-      oc
-        .replyPermissionDirect(pending.requestId, decisionToResponse(decision), pending.directory)
-        .catch(() =>
-          oc.replyPermission(id, pending.requestId, decisionToResponse(decision), pending.directory),
-        )
-        .catch((err: Error) => {
-          emit(id, { type: "notification", message: `Permission reply failed: ${err.message}` });
-        });
+      oc.replyPermission(pending.sessionId, pending.requestId, decisionToResponse(decision)).catch((err: Error) => {
+        log(`[permission] ${pending.requestId}: ${err.message}`);
+        emit(id, { type: "notification", message: `Permission reply failed: ${err.message}` });
+      });
     },
 
     respondQuestion(id, answer) {
       const pending = shiftAsk("question", id);
       if (!pending) return;
       clearPending("question", id, pending.requestId);
-      const answers = parseQuestionAnswer(answer, pending.questions);
+      const labels = parseQuestionAnswer(answer, pending.questions);
       const answerMap: Record<string, string> = {};
       pending.questions.forEach((q, i) => {
-        answerMap[q.question ?? q.header ?? `q${i}`] = answers[i] ?? "";
+        answerMap[q.question] = labels[i] ?? "";
       });
       emit(id, { type: "question_answer", answers: answerMap });
-      oc
-        // opencode wants per-question arrays of selected labels
-        .replyQuestionDirect(pending.requestId, answers.map((a) => [a]), pending.directory)
-        .catch(() => oc.replyQuestion(id, pending.requestId, answers, pending.directory))
-        .catch((err: Error) => {
-          emit(id, { type: "notification", message: `Answer failed: ${err.message}` });
-        });
+      const formAnswer = formAnswerFromLabels(pending.questions, labels);
+      const skipped = answer.trim().toLowerCase() === "skip" || Object.keys(formAnswer).length === 0;
+      const call = skipped
+        ? oc.cancelForm(pending.sessionId, pending.requestId)
+        : oc.replyForm(pending.sessionId, pending.requestId, formAnswer);
+      call.catch((err: Error) => {
+        log(`[question] ${pending.requestId}: ${err.message}`);
+        emit(id, { type: "notification", message: `Answer failed: ${err.message}` });
+      });
     },
 
     interrupt(id) {
-      const session = knownSessions.get(id);
-      oc.interrupt(id, session?.directory).catch(() => undefined);
-      busySessions.delete(id);
+      oc.interrupt(id).catch((err: Error) => log(`[interrupt] ${id}: ${err.message}`));
+      markIdle(id);
       busySince.delete(id);
+      idleHandled.add(id); // the upstream interrupted event must not add a result card
+      coalescer.flush(id);
+      for (const closed of translator.closeBlock(id)) emit(closed.sessionId, closed.msg);
       emit(id, { type: "status", state: "idle", sessionId: id });
     },
 
     getStatus(id) {
-      if (knownSessions.has(id)) {
-        const state = sessionState(activity, id, hasPendingAsk(id));
-        return { state, provider: PROVIDER_NAME };
-      }
-      // registry-persisted sessions (e.g. projectless, post-restart) stay answerable
-      return null;
+      if (!knownSessions.has(id) && !activity[id] && !hasPendingAsk(id)) return null;
+      return { state: sessionState(activity, id, hasPendingAsk(id)), provider: PROVIDER_NAME };
     },
 
     start() {
-      void loadRegistry().then(() => syncSnapshot());
+      void syncSnapshot();
       upstream = connectUpstream({
         url: eventUrl,
+        headers: oc.authHeaders(),
         onEvent: handleUpstreamEvent,
         onConnected: () => {
+          log(`[upstream] connected ${eventUrl}`);
           // fresh state after (re)connect: sessions, activity, pending asks
           void syncSnapshot();
         },
+        onDisconnected: (reason) => log(`[upstream] disconnected${reason ? `: ${reason}` : ""}`),
       });
       syncTimer = setInterval(() => {
         void syncSnapshot();
       }, SYNC_INTERVAL_MS);
-      statsTimer = setInterval(emitRunningStats, RUNNING_STATS_INTERVAL_MS);
     },
 
     stop() {
@@ -679,6 +631,8 @@ export function createOpencodeProvider(
       syncTimer = null;
       if (statsTimer) clearInterval(statsTimer);
       statsTimer = null;
+      if (askResyncTimer) clearTimeout(askResyncTimer);
+      askResyncTimer = null;
     },
   };
 

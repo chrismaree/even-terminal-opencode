@@ -9,6 +9,13 @@ export interface BridgeServerOptions {
   provider: EvenProvider;
   hub: MessageHub;
   token: string;
+  /** request/diagnostic log sink (default console.log) */
+  log?: (line: string) => void;
+}
+
+/** Request path for logs, with the pairing token redacted. */
+function redactUrl(raw: string | undefined): string {
+  return (raw ?? "").replace(/([?&]token=)[^&]*/g, "$1***");
 }
 
 const DECISIONS: ReadonlySet<string> = new Set(["allow", "allowAlways", "deny"]);
@@ -41,16 +48,19 @@ async function readBody(req: IncomingMessage, maxBytes = 1_000_000): Promise<Rec
 
 export function createBridgeServer(opts: BridgeServerOptions): Server {
   const { provider, hub, token } = opts;
+  const log = opts.log ?? ((line: string) => console.log(line));
 
   return createServer((req, res) => {
     const startedAt = process.hrtime.bigint();
+    if (req.url?.includes("/api/events")) log(`SSE ${req.method} ${redactUrl(req.url)}`);
     res.on("finish", () => {
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
       // SSE streams "finish" only on close; skip their completion noise
       if (req.url?.includes("/api/events")) return;
-      console.log(`${res.statusCode} ${req.method} ${req.url} ${durationMs.toFixed(1)}ms`);
+      log(`${res.statusCode} ${req.method} ${redactUrl(req.url)} ${durationMs.toFixed(1)}ms`);
     });
     void handle(req, res).catch((err: Error) => {
+      log(`[bridge] ${req.method} ${redactUrl(req.url).split("?")[0]} failed: ${err.message}`);
       if (!res.headersSent) json(res, 500, { error: err.message });
       else res.end();
     });
@@ -112,6 +122,7 @@ export function createBridgeServer(opts: BridgeServerOptions): Server {
         );
         json(res, 200, { sessions });
       } catch (err) {
+        log(`[sessions] failed: ${(err as Error).message}`);
         json(res, 200, { sessions: [], error: (err as Error).message });
       }
       return;
@@ -191,6 +202,7 @@ export function createBridgeServer(opts: BridgeServerOptions): Server {
         json(res, 202, { ok: true, sessionId: result.sessionId, provider: result.provider });
       } catch (err) {
         const status = (err as { statusCode?: number }).statusCode ?? 500;
+        log(`[prompt] failed: ${(err as Error).message}`);
         json(res, status, { error: (err as Error).message });
       }
       return;
